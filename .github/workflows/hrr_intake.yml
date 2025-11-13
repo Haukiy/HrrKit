@@ -2,10 +2,10 @@ name: HRR Intake (Issues)
 
 on:
   issues:
-    types: [opened, edited, labeled]
+    types: [labeled]           # <-- only on label add (prevents double-runs)
   issue_comment:
-    types: [created]
-  workflow_dispatch:
+    types: [created]           # allow /process re-run
+  workflow_dispatch:           # manual run from Actions UI
 
 permissions:
   contents: write
@@ -14,16 +14,17 @@ permissions:
 jobs:
   run:
     # Run when:
-    #  - the issue has label 'hrr-intake' OR its title starts with 'HRR Intake'
+    #  - issue is labeled 'hrr-intake'
     #  - someone comments '/process'
     #  - manual dispatch
     if: >
-      (github.event_name == 'issues' && (
-        contains(join(github.event.issue.labels.*.name, ','), 'hrr-intake') ||
-        startsWith(github.event.issue.title, 'HRR Intake')
-      )) ||
-      (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/process')) ||
+      (github.event_name == 'issues' &&
+       github.event.action == 'labeled' &&
+       contains(join(github.event.issue.labels.*.name, ','), 'hrr-intake')) ||
+      (github.event_name == 'issue_comment' &&
+       startsWith(github.event.comment.body, '/process')) ||
       (github.event_name == 'workflow_dispatch')
+
     runs-on: ubuntu-latest
 
     steps:
@@ -35,7 +36,7 @@ jobs:
       - name: Debug event
         run: |
           echo "event:  ${{ github.event_name }}"
-          echo "ref:    ${{ github.ref }}"
+          echo "action: ${{ github.event.action }}"
           echo "labels: ${{ join(github.event.issue.labels.*.name, ',') }}"
           echo "title:  ${{ github.event.issue.title }}"
 
@@ -49,7 +50,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy pandas matplotlib openpyxl requests
 
-      # Use injected core/github/context (do NOT require them).
       - name: Extract issue payload
         id: payload
         uses: actions/github-script@v7
@@ -119,25 +119,15 @@ jobs:
 
           def extract_inline_files(text: str) -> dict:
               """
-              Support embedding raw files directly in the issue.
-              Recognized forms inside fenced blocks:
-
-              1) Info string with filename=... :
-                 ```csv filename=CAR_2010_Test01_raw.csv
-                 <content>
-                 ```
-
-              2) First line inside block declares file:
-                 ```text
-                 file: CAR_2010_Test01_raw.csv
-                 <content>
-                 ```
-                 or
-                 ```text
-                 # file: CAR_2010_Test01_raw.csv
-                 <content>
-                 ```
-              Returns: { "filename.csv": "file content\n" , ... }
+              Allow embedding raw files directly in the issue:
+                ```csv filename=CAR_2010_Test01_raw.csv
+                <content>
+                ```
+              or:
+                ```text
+                file: CAR_2010_Test01_raw.csv
+                <content>
+                ```
               """
               files = {}
               for m in re.finditer(r"```([^\n]*)\n([\s\S]*?)```", text):
@@ -145,12 +135,10 @@ jobs:
                   content = m.group(2)
                   filename = None
 
-                  # Case 1: info string contains filename=
                   mfn = re.search(r"filename\s*=\s*([^\s]+)", info, flags=re.I)
                   if mfn:
                       filename = mfn.group(1).strip()
 
-                  # Case 2: first content line declares file:
                   if not filename:
                       first_line, *rest = content.splitlines()
                       mline = re.search(r"^\s*(?:#\s*)?file\s*:\s*(.+)$", first_line.strip(), flags=re.I)
@@ -329,6 +317,7 @@ jobs:
 
       - name: Commit changes (if labeled hrr-commit)
         if: ${{ steps.aclabel.outputs.commit == 'true' }}
+        shell: bash
         run: |
           set -e
           git config user.name  "github-actions[bot]"
