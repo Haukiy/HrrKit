@@ -53,7 +53,90 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import requests
-import isbnlib
+
+try:  # pragma: no cover - dependency availability differs per environment
+    import isbnlib  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - exercised when isbnlib missing
+    class _IsbnLibFallback:
+        """Small subset of isbnlib used by HRRkit.
+
+        The real isbnlib package is preferred, but in environments where it is
+        unavailable (such as GitHub Actions runners without optional
+        dependencies), this lightweight fallback provides the features required
+        by the script:
+
+        * ``canonical`` – keep only digits/X and uppercase the value.
+        * ``is_isbn10``/``is_isbn13`` – validate checksum for 10/13-digit ISBNs.
+        * ``meta`` – fetch limited metadata from the Google Books API.
+        """
+
+        _ISBN10_WEIGHTS = list(range(10, 0, -1))
+
+        @staticmethod
+        def canonical(value: str) -> str:
+            cleaned = re.sub(r"[^0-9Xx]", "", value or "")
+            return cleaned.upper()
+
+        @classmethod
+        def _isbn10_checksum(cls, digits: str) -> bool:
+            if len(digits) != 10:
+                return False
+            total = 0
+            for weight, char in zip(cls._ISBN10_WEIGHTS, digits):
+                if char == "X":
+                    val = 10
+                elif char.isdigit():
+                    val = int(char)
+                else:
+                    return False
+                total += weight * val
+            return total % 11 == 0
+
+        @staticmethod
+        def _isbn13_checksum(digits: str) -> bool:
+            if len(digits) != 13 or not digits.isdigit():
+                return False
+            total = 0
+            for idx, char in enumerate(digits):
+                weight = 1 if idx % 2 == 0 else 3
+                total += weight * int(char)
+            return total % 10 == 0
+
+        @classmethod
+        def is_isbn10(cls, value: str) -> bool:
+            return cls._isbn10_checksum(cls.canonical(value))
+
+        @classmethod
+        def is_isbn13(cls, value: str) -> bool:
+            return cls._isbn13_checksum(cls.canonical(value))
+
+        @staticmethod
+        def meta(isbn_value: str) -> Dict[str, Any]:
+            canonical = _IsbnLibFallback.canonical(isbn_value)
+            if len(canonical) not in (10, 13):
+                return {}
+            url = (
+                "https://www.googleapis.com/books/v1/volumes?q=isbn:" + canonical
+            )
+            try:
+                resp = requests.get(url, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                return {}
+
+            items = data.get("items") or []
+            if not items:
+                return {}
+            volume = items[0].get("volumeInfo", {})
+            return {
+                "Authors": volume.get("authors") or [],
+                "Title": volume.get("title", ""),
+                "Publisher": volume.get("publisher", ""),
+                "Year": volume.get("publishedDate", "")[:4],
+            }
+
+    isbnlib = _IsbnLibFallback()
 
 
 # ----------------------------- Configuration --------------------------------
