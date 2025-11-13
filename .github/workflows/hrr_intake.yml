@@ -61,7 +61,7 @@ jobs:
             core.setOutput('body', issue.body ?? '');
             core.setOutput('labels', (issue.labels ?? []).map(l => l.name).join(','));
 
-      - name: Prepare raw_files, parse CSV from issue, download attachments, update Excel
+      - name: Prepare raw_files, parse CSV from issue, pull files (attachments or inline), update Excel
         env:
           ISSUE_BODY: ${{ steps.payload.outputs.body }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -76,6 +76,7 @@ jobs:
           body = os.environ.get("ISSUE_BODY","")
           TOKEN = os.environ.get("GITHUB_TOKEN","").strip()
 
+          # ---------- Helpers ----------
           def find_csv_block(text: str) -> str:
               # 1) Prefer fenced code block ```csv ... ``` (or any ``` ... ```)
               m = re.search(r"```(?:csv)?\s*([\s\S]*?)\s*```", text, flags=re.I)
@@ -116,40 +117,92 @@ jobs:
                   break
               return "\n".join(out).strip()
 
-          def download_with_auth(url: str, dest: pathlib.Path) -> None:
+          def extract_inline_files(text: str) -> dict:
+              """
+              Support embedding raw files directly in the issue.
+              Recognized forms inside fenced blocks:
+
+              1) Info string with filename=... :
+                 ```csv filename=CAR_2010_Test01_raw.csv
+                 <content>
+                 ```
+
+              2) First line inside block declares file:
+                 ```text
+                 file: CAR_2010_Test01_raw.csv
+                 <content>
+                 ```
+                 or
+                 ```text
+                 # file: CAR_2010_Test01_raw.csv
+                 <content>
+                 ```
+              Returns: { "filename.csv": "file content\n" , ... }
+              """
+              files = {}
+              for m in re.finditer(r"```([^\n]*)\n([\s\S]*?)```", text):
+                  info = (m.group(1) or "").strip()
+                  content = m.group(2)
+                  filename = None
+
+                  # Case 1: info string contains filename=
+                  mfn = re.search(r"filename\s*=\s*([^\s]+)", info, flags=re.I)
+                  if mfn:
+                      filename = mfn.group(1).strip()
+
+                  # Case 2: first content line declares file:
+                  if not filename:
+                      first_line, *rest = content.splitlines()
+                      mline = re.search(r"^\s*(?:#\s*)?file\s*:\s*(.+)$", first_line.strip(), flags=re.I)
+                      if mline:
+                          filename = mline.group(1).strip()
+                          content = "\n".join(rest) + ("\n" if rest else "")
+
+                  if filename:
+                      files[pathlib.Path(filename).name] = content
+              return files
+
+          def download_with_auth(url: str, dest: pathlib.Path) -> bool:
+              """
+              Try to download with auth (public repos: succeeds without; private issue attachments may still 404).
+              Returns True if saved, False otherwise.
+              """
               headers = {
                   "Accept": "application/octet-stream",
                   "User-Agent": "gh-actions-hrr-intake",
               }
               if TOKEN:
-                  # use the real token
                   headers["Authorization"] = f"token {TOKEN}"
-              # Try canonical URL then explicit download variant
               for attempt_url in (url, url + "?download=1"):
-                  r = requests.get(attempt_url, headers=headers, allow_redirects=True, timeout=120)
+                  try:
+                      r = requests.get(attempt_url, headers=headers, allow_redirects=True, timeout=120)
+                      if r.ok:
+                          dest.parent.mkdir(parents=True, exist_ok=True)
+                          with open(dest, "wb") as f:
+                              f.write(r.content)
+                          return True
+                  except Exception:
+                      pass
+              # final unauth try (public)
+              try:
+                  r = requests.get(url, allow_redirects=True, timeout=120)
                   if r.ok:
                       dest.parent.mkdir(parents=True, exist_ok=True)
                       with open(dest, "wb") as f:
                           f.write(r.content)
-                      return
-              # Final unauth try (for public repos)
-              r = requests.get(url, allow_redirects=True, timeout=120)
-              if r.ok:
-                  dest.parent.mkdir(parents=True, exist_ok=True)
-                  with open(dest, "wb") as f:
-                      f.write(r.content)
-                  return
-              raise SystemExit(f"Download failed ({r.status_code}) for: {url}")
+                      return True
+              except Exception:
+                  pass
+              return False
 
+          # ---------- Parse DB rows ----------
           csv_block = find_csv_block(body)
           if not csv_block:
               print("No CSV block found in issue body.", file=sys.stderr)
               print("Body preview:", body[:300].replace("\n","\\n"), file=sys.stderr)
               sys.exit(1)
 
-          # Normalize minor whitespace
           csv_block = re.sub(r",\s+", ",", csv_block)
-
           rows = list(csv.DictReader(io.StringIO(csv_block)))
           if not rows:
               print("CSV block parsed but contains no rows.", file=sys.stderr); sys.exit(1)
@@ -160,11 +213,12 @@ jobs:
               print("CSV header mismatch. Need exactly:", ", ".join(required), file=sys.stderr)
               sys.exit(1)
 
-          # Attachment links to .csv → map by basename
+          # ---------- Attachments + Inline file map ----------
           urls = re.findall(r"\((https?://[^\s)]+\.csv)\)", body, flags=re.I)
           url_map = {pathlib.Path(u.split("?")[0]).name: u for u in urls}
+          inline_files = extract_inline_files(body)  # {"filename.csv": "content\n", ...}
 
-          # Ensure database.xlsx exists
+          # ---------- Ensure database.xlsx ----------
           xls = pathlib.Path("database.xlsx")
           if xls.exists():
               df = pd.read_excel(xls, engine="openpyxl")
@@ -176,21 +230,37 @@ jobs:
 
           raw_dir = pathlib.Path("raw_files"); raw_dir.mkdir(parents=True, exist_ok=True)
 
-          # Download attachments using the Filename column
+          # ---------- For each row, ensure the raw file exists (download or inline) ----------
           for r in rows:
               for k in required:
                   if not str(r.get(k, "")).strip():
                       print(f"Missing field in CSV row: {k}", file=sys.stderr); sys.exit(1)
+
               desired = r["Filename"].strip()
               base = pathlib.Path(desired).name
-              url = url_map.get(base)
-              if not url:
-                  print(f"Attachment for '{desired}' not found among links.", file=sys.stderr); sys.exit(1)
               dest = raw_dir / desired
-              print(f"Downloading -> {dest}")
-              download_with_auth(url, dest)
 
-          # Append/update rows (unique by ID+Filename)
+              # 1) Try attachment download (works for public; often 404 for private)
+              have = False
+              if base in url_map:
+                  print(f"Attempting download -> {dest}")
+                  have = download_with_auth(url_map[base], dest)
+
+              # 2) If download failed or no URL, try inline file block
+              if not have and base in inline_files:
+                  print(f"Writing inline file -> {dest}")
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  with open(dest, "w", newline="") as f:
+                      f.write(inline_files[base])
+                  have = True
+
+              if not have:
+                  print(f"Could not obtain '{desired}'.", file=sys.stderr)
+                  print("Either attach the CSV (public repo) or embed it as a code block like:", file=sys.stderr)
+                  print("```csv filename=" + base + "\\n<your csv content>\\n```", file=sys.stderr)
+                  sys.exit(1)
+
+          # ---------- Append/update DB rows ----------
           if not {"ProcessedAt","Peak_kW","Area_kJ","UID","Concise ID"}.issubset(df.columns):
               for c in ["ProcessedAt","UID","Concise ID"]:
                   if c not in df.columns: df[c] = pd.Series(dtype="string")
@@ -260,14 +330,18 @@ jobs:
       - name: Commit changes (if labeled hrr-commit)
         if: ${{ steps.aclabel.outputs.commit == 'true' }}
         run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
           if [ -n "$(git status --porcelain)" ]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -A
             git commit -m "HRR (issue #${{ steps.payload.outputs.number }}): processed inputs [skip ci]"
             git push
-          else:
+          else
             echo "No changes to commit."
+          fi
 
       - name: Comment result on issue
         uses: actions/github-script@v7
@@ -281,7 +355,14 @@ jobs:
               `- Results attached as workflow artifact: **${artifactName}**`,
               '- If the issue had the `hrr-commit` label, outputs were committed to the repo.',
               '',
-              'Re-run this intake by commenting: `/process`'
+              'Re-run this intake by commenting: `/process`',
+              '',
+              'Tip for private repos: if attachment downloads fail, embed raw CSV files like:',
+              '```csv filename=CAR_2010_Test01_raw.csv',
+              'time,value',
+              '0,0',
+              '10,123',
+              '```'
             ].join('\n');
             await github.rest.issues.createComment({
               owner: context.repo.owner,
