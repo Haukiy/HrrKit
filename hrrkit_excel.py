@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HRRkit – Excel-driven HRR processor (concise IDs, UID in Excel, one-column sources table, plots folder)
+HRRkit – CSV-driven HRR processor (concise IDs, UID in CSV, one-column sources table, plots folder)
 
-Excel schema (in the main directory):
-  database.xlsx   with columns (exact names):
+CSV schema (in the main directory):
+  database.csv    with columns (exact names):
     ID | Scource in IDEEE | Time Unit | Energy Unit | Topic | Filename | ProcessedAt | Peak_kW | Area_kJ
   The script ADDS (if absent) and fills:
     UID | Concise ID
@@ -32,7 +32,7 @@ Aggregation plot:
 Run:
   python hrrkit_excel.py
   # optional:
-  python hrrkit_excel.py --quantile 0.95 --base hrr_database --excel database.xlsx --raw raw_files
+  python hrrkit_excel.py --quantile 0.95 --base hrr_database --database database.csv --raw raw_files
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ import matplotlib.pyplot as plt
 # ----------------------------- Configuration --------------------------------
 
 DEFAULT_BASE_DIR = "hrr_database"
-DEFAULT_EXCEL = "database.xlsx"
+DEFAULT_DATABASE = "database.csv"
 DEFAULT_RAW_DIR = "raw_files"
 AGGREGATE_STEP_S = 2.0
 SHAPE_SUPPORT_POINTS = 25
@@ -129,11 +129,34 @@ def ensure_topic_structure(base_dir: Path, topic_name: str) -> TopicPaths:
 
     # minimal topic index for traceability
     index_path = base_dir / "hrr_topics_index.csv"
-    if not index_path.exists():
+    existing_topics: List[str] = []
+    legacy_format = True
+    if index_path.exists():
+        legacy_format = False
+        with index_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header or len(header) != 1 or header[0].strip().lower() != "topic_name":
+                legacy_format = True
+            for row in reader:
+                if not row:
+                    continue
+                entry = (row[-1] or "").strip()
+                if entry and entry not in existing_topics:
+                    existing_topics.append(entry)
+
+    topic_entry = (str(topic_name).strip() or topic_slug)
+    needs_write = legacy_format or not index_path.exists()
+    if topic_entry and topic_entry not in existing_topics:
+        existing_topics.append(topic_entry)
+        needs_write = True
+
+    if needs_write:
         with index_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["topic_slug", "topic_name"])
-            writer.writerow([topic_slug, topic_name])
+            writer.writerow(["topic_name"])
+            for entry in existing_topics:
+                writer.writerow([entry])
 
     return TopicPaths(
         base_dir=base_dir,
@@ -147,7 +170,7 @@ def ensure_topic_structure(base_dir: Path, topic_name: str) -> TopicPaths:
     )
 
 
-# --------------------------- Excel / units helpers ---------------------------
+# --------------------------- CSV / units helpers ----------------------------
 
 def normalize_time_unit(unit_in: str) -> str:
     key = (unit_in or "").strip()
@@ -170,25 +193,27 @@ def _ensure_string_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame
     return df
 
 
-def read_database(excel_path: Path) -> pd.DataFrame:
-    if not excel_path.exists():
+def read_database(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
         # Create template with proper dtypes
         template_cols = {c: pd.Series(dtype="string") for c in REQUIRED_COLUMNS + OPTIONAL_ADDED_COLUMNS}
         template_cols["Peak_kW"] = pd.Series(dtype="float64")
         template_cols["Area_kJ"] = pd.Series(dtype="float64")
         empty_df = pd.DataFrame(template_cols)
-        try:
-            empty_df.to_excel(excel_path, index=False)
-        except Exception:
-            with pd.ExcelWriter(excel_path) as xw:
-                empty_df.to_excel(xw, index=False)
-        print(f"Created template workbook at: {excel_path}")
+        empty_df.to_csv(csv_path, index=False)
+        print(f"Created template CSV at: {csv_path}")
         return empty_df
 
     try:
-        db_df = pd.read_excel(excel_path, engine="openpyxl")
-    except Exception:
-        db_df = pd.read_excel(excel_path)
+        db_df = pd.read_csv(csv_path)
+    except pd.errors.EmptyDataError:
+        template_cols = {c: pd.Series(dtype="string") for c in REQUIRED_COLUMNS + OPTIONAL_ADDED_COLUMNS}
+        template_cols["Peak_kW"] = pd.Series(dtype="float64")
+        template_cols["Area_kJ"] = pd.Series(dtype="float64")
+        empty_df = pd.DataFrame(template_cols)
+        empty_df.to_csv(csv_path, index=False)
+        print(f"Recreated empty CSV at: {csv_path}")
+        return empty_df
 
     # Ensure required/optional columns exist
     for col in REQUIRED_COLUMNS + OPTIONAL_ADDED_COLUMNS:
@@ -216,13 +241,8 @@ def read_database(excel_path: Path) -> pd.DataFrame:
     return db_df
 
 
-def write_database(excel_path: Path, db_df: pd.DataFrame) -> None:
-    try:
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as xw:
-            db_df.to_excel(xw, index=False)
-    except Exception:
-        with pd.ExcelWriter(excel_path) as xw:
-            db_df.to_excel(xw, index=False)
+def write_database(csv_path: Path, db_df: pd.DataFrame) -> None:
+    db_df.to_csv(csv_path, index=False)
 
 
 # ------------------------------ CSV utilities --------------------------------
@@ -403,7 +423,7 @@ def normalise_curve_seconds_kw(
     time_unit: str,
     energy_unit: str,
 ) -> pd.DataFrame:
-    """Convert time to seconds and HRR to kW based on Excel units."""
+    """Convert time to seconds and HRR to kW based on database units."""
     time_unit_norm = normalize_time_unit(time_unit)
     energy_unit_norm = normalize_energy_unit(energy_unit)
     if not time_unit_norm or not energy_unit_norm:
@@ -499,7 +519,7 @@ def process_row_to_files(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[str], Optional[Dict[str, Any]]]:
     """
     Returns:
-      (stats or None, error or None, topic or None, meta for registry/excel or None)
+      (stats or None, error or None, topic or None, meta for registry/database or None)
     """
     row_id = str(row["ID"]).strip()
     ideee = str(row["Scource in IDEEE"]).strip()
@@ -796,21 +816,24 @@ def aggregate_topic(base_dir: Path, topic: str, quantile_q: float = AGG_QUANTILE
 # ----------------------------------- Main ------------------------------------
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Excel-driven HRR processor (concise IDs, UID in Excel, one-column sources table, plots folder).")
-    parser.add_argument("--excel", default=DEFAULT_EXCEL, help="Workbook (default: database.xlsx)")
+    parser = argparse.ArgumentParser(description="CSV-driven HRR processor (concise IDs, UID in CSV, one-column sources table, plots folder).")
+    parser.add_argument(
+        "--database", "--csv", "--excel", dest="database", default=DEFAULT_DATABASE,
+        help="Database CSV file (default: database.csv)"
+    )
     parser.add_argument("--raw",   default=DEFAULT_RAW_DIR, help="Folder with raw CSV files (default: raw_files)")
     parser.add_argument("--base",  default=DEFAULT_BASE_DIR, help="Output base directory (default: hrr_database)")
     parser.add_argument("--quantile", type=float, default=AGG_QUANTILE, help="Quantile for aggregate curve (0..1)")
     args = parser.parse_args()
 
-    excel_path = Path(args.excel).resolve()
+    database_path = Path(args.database).resolve()
     raw_dir = Path(args.raw).resolve()
     base_dir = Path(args.base).resolve()
 
     ensure_directory(raw_dir)
     ensure_directory(base_dir)
 
-    db_df = read_database(excel_path)
+    db_df = read_database(database_path)
     if db_df.empty:
         print("No rows to process. Fill the template and rerun.")
         return
@@ -849,9 +872,9 @@ def main() -> None:
         processed_topics.add(topic)
         registry_updates.setdefault(topic, []).append(meta)
 
-    # Write updated workbook
-    write_database(excel_path, db_df)
-    print(f"Workbook updated -> {excel_path}")
+    # Write updated database
+    write_database(database_path, db_df)
+    print(f"Database CSV updated -> {database_path}")
 
     # Update per-topic registry
     for topic, updates in registry_updates.items():

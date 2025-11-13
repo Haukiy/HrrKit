@@ -1,5 +1,5 @@
 name: HRR Intake
-description: Upload HRR raw CSV(s) and provide rows for the database.xlsx
+description: Upload HRR raw CSV(s) and provide rows for the database.csv
 title: "HRR Intake: <short topic or ID>"
 labels: ["hrr-intake"]
 body:
@@ -8,19 +8,41 @@ body:
       value: |
         **Instructions**
         1) Attach raw CSV file(s) by drag-and-drop below (GitHub will insert links).
-        2) Paste rows for `database.xlsx` in the CSV block *exactly* with these headers:
-           `ID,Scource in IDEEE,Time Unit,Energy Unit,Topic,Filename`
-        3) Ensure `Filename` matches the desired name we should save your attachment(s) as.
+        2) For each attachment, fill out the following block (IDs can simply be 1, 2, 3... **for this issue only**—we handle the global IDs in the CSV):
+
+           ```
+           ID: <per-issue number>
+           Scource in IDEEE: <who provided the data>
+           Topic: <topic name>
+           Filename (save as): <desired filename in database.csv>
+           Time Unit: <e.g., s>
+           Energy Unit: <e.g., kW>
+           Attachment filename: <the name GitHub inserts after you upload the file>
+           ```
+
+        3) Repeat the block for every file you are submitting and paste the combined text into the field below.
 
   - type: textarea
     id: rows_csv
     attributes:
-      label: Rows for database.xlsx (CSV)
-      description: One row per file. Example given below.
+      label: File details for database.csv
+      description: Copy/paste one block per file using the template from the instructions.
       value: |
-        ID,Scource in IDEEE,Time Unit,Energy Unit,Topic,Filename
-        CAR_2010_Test01,Siemens Switzerland AG; DBI, s, kW, car, CAR_2010_Test01_raw.csv
-        CAR_2010_Test02,Siemens Switzerland AG; DBI, s, kW, car, CAR_2010_Test02_raw.csv
+        ID: 1
+        Scource in IDEEE: Siemens Switzerland AG; DBI
+        Topic: car
+        Filename (save as): CAR_2010_Test01_raw.csv
+        Time Unit: s
+        Energy Unit: kW
+        Attachment filename: CAR_2010_Test01_raw.csv (uploaded below)
+
+        ID: 2
+        Scource in IDEEE: Siemens Switzerland AG; DBI
+        Topic: car
+        Filename (save as): CAR_2010_Test02_raw.csv
+        Time Unit: s
+        Energy Unit: kW
+        Attachment filename: CAR_2010_Test02_raw.csv (uploaded below)
     validations:
       required: true
 

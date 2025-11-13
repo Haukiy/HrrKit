@@ -50,7 +50,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pandas matplotlib openpyxl requests
+          pip install numpy pandas matplotlib requests
 
       - name: Extract issue payload
         id: payload
@@ -73,7 +73,7 @@ jobs:
             const commitFromComment = isComment && body.trim().startsWith('/intake-commit');
             core.setOutput('commit_from_comment', commitFromComment ? 'true' : 'false');
 
-      - name: Prepare raw_files, parse CSV from issue, pull files (attachments or inline), update Excel
+      - name: Prepare raw_files, parse CSV from issue, pull files (attachments or inline), update database.csv
         env:
           ISSUE_BODY: ${{ steps.payload.outputs.body }}
           ISSUE_NUMBER: ${{ steps.payload.outputs.number }}
@@ -198,10 +198,10 @@ jobs:
           url_map = {pathlib.Path(u.split("?")[0]).name: u for u in urls}
           inline_files = extract_inline_files(body)  # {"filename.csv": "content\n", ...}
 
-          # ---------- Ensure database.xlsx ----------
-          xls = pathlib.Path("database.xlsx")
-          if xls.exists():
-              df = pd.read_excel(xls, engine="openpyxl")
+          # ---------- Ensure database.csv ----------
+          csv_path = pathlib.Path("database.csv")
+          if csv_path.exists():
+              df = pd.read_csv(csv_path)
           else:
               df = pd.DataFrame(columns=[
                   "ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename",
@@ -288,8 +288,7 @@ jobs:
           if to_add:
               df = pd.concat([df, pd.DataFrame(to_add)], ignore_index=True)
 
-          with pd.ExcelWriter(xls, engine="openpyxl") as xw:
-              df.to_excel(xw, index=False)
+          df.to_csv(csv_path, index=False)
           PY
 
       - name: Run HRR processor
@@ -305,7 +304,7 @@ jobs:
             print("Error: neither hrr_chat.py nor hrrkit_excel.py found", file=sys.stderr)
             sys.exit(1)
           sys.exit(subprocess.call([sys.executable, script,
-            "--excel","database.xlsx","--raw","raw_files","--base","hrr_database","--quantile","0.90"]))
+            "--database","database.csv","--raw","raw_files","--base","hrr_database","--quantile","0.90"]))
           PY
 
       - name: Ensure output dir for artifact
@@ -317,7 +316,7 @@ jobs:
           name: hrr-outputs-issue-${{ steps.payload.outputs.number }}
           path: |
             hrr_database/**
-            database.xlsx
+            database.csv
           if-no-files-found: warn
           retention-days: 10
 
