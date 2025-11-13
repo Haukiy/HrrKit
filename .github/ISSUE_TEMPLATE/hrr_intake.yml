@@ -1,0 +1,31 @@
+name: HRR Intake
+description: Upload HRR raw CSV(s) and provide rows for the database.xlsx
+title: "HRR Intake: <short topic or ID>"
+labels: ["hrr-intake"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Instructions**
+        1) Attach raw CSV file(s) by drag-and-drop below (GitHub will insert links).
+        2) Paste rows for `database.xlsx` in the CSV block *exactly* with these headers:
+           `ID,Scource in IDEEE,Time Unit,Energy Unit,Topic,Filename`
+        3) Ensure `Filename` matches the desired name we should save your attachment(s) as.
+
+  - type: textarea
+    id: rows_csv
+    attributes:
+      label: Rows for database.xlsx (CSV)
+      description: One row per file. Example given below.
+      value: |
+        ID,Scource in IDEEE,Time Unit,Energy Unit,Topic,Filename
+        CAR_2010_Test01,Siemens Switzerland AG; DBI, s, kW, car, CAR_2010_Test01_raw.csv
+        CAR_2010_Test02,Siemens Switzerland AG; DBI, s, kW, car, CAR_2010_Test02_raw.csv
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes (optional)
+      description: Anything the maintainers should know.

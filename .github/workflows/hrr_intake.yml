@@ -1,0 +1,291 @@
+name: HRR Intake (Issues)
+
+on:
+  issues:
+    types: [opened, edited, labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  run:
+    # Run when:
+    #  - the issue has label 'hrr-intake' OR its title starts with 'HRR Intake'
+    #  - someone comments '/process'
+    #  - manual dispatch
+    if: >
+      (github.event_name == 'issues' && (
+        contains(join(github.event.issue.labels.*.name, ','), 'hrr-intake') ||
+        startsWith(github.event.issue.title, 'HRR Intake')
+      )) ||
+      (github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/process')) ||
+      (github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout (with LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Debug event
+        run: |
+          echo "event:  ${{ github.event_name }}"
+          echo "ref:    ${{ github.ref }}"
+          echo "labels: ${{ join(github.event.issue.labels.*.name, ',') }}"
+          echo "title:  ${{ github.event.issue.title }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas matplotlib openpyxl requests
+
+      # Use injected core/github/context (do NOT require them).
+      - name: Extract issue payload
+        id: payload
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            core.setOutput('number', String(issue.number));
+            core.setOutput('title', issue.title ?? '');
+            core.setOutput('body', issue.body ?? '');
+            core.setOutput('labels', (issue.labels ?? []).map(l => l.name).join(','));
+
+      - name: Prepare raw_files, parse CSV from issue, download attachments, update Excel
+        env:
+          ISSUE_BODY: ${{ steps.payload.outputs.body }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p raw_files
+
+          python - << 'PY'
+          import os, re, sys, csv, io, pathlib, requests
+          import pandas as pd
+
+          body = os.environ.get("ISSUE_BODY","")
+          TOKEN = os.environ.get("GITHUB_TOKEN","").strip()
+
+          def find_csv_block(text: str) -> str:
+              # 1) Prefer fenced code block ```csv ... ``` (or any ``` ... ```)
+              m = re.search(r"```(?:csv)?\s*([\s\S]*?)\s*```", text, flags=re.I)
+              if m:
+                  return m.group(1).strip()
+
+              # 2) Fallback: locate header anywhere, then collect CSV-looking lines
+              lines = text.splitlines()
+              canonical = "id,scource in ideee,time unit,energy unit,topic,filename"
+              canonical_nospace = re.sub(r"\s+", "", canonical)
+
+              start = None
+              for i, line in enumerate(lines):
+                  raw = line.strip().lower()
+                  if not raw:
+                      continue
+                  norm = re.sub(r"\s*,\s*", ",", raw)
+                  if norm == canonical or re.sub(r"\s+", "", raw) == canonical_nospace:
+                      start = i; break
+              if start is None:
+                  return ""
+
+              out = [re.sub(r"\s*,\s*", ",", lines[start].strip())]
+              for j in range(start+1, len(lines)):
+                  s = lines[j]
+                  if not s.strip():
+                      break
+                  cnt = s.count(",")
+                  # data rows usually have ≥5 commas; accept "n,..." rows as well
+                  if cnt >= 5 or (re.match(r"^\s*\d+\s*,", s) and cnt >= 5):
+                      out.append(re.sub(r"\s*,\s*", ",", s.strip()))
+                      continue
+                  # stop at attachments/links/other sections
+                  if s.lstrip().startswith("[") or s.lstrip().startswith("http"):
+                      break
+                  if s.lstrip().startswith("#") or "Notes (optional)" in s or "Attachments" in s:
+                      break
+                  break
+              return "\n".join(out).strip()
+
+          def download_with_auth(url: str, dest: pathlib.Path) -> None:
+              headers = {
+                  "Accept": "application/octet-stream",
+                  "User-Agent": "gh-actions-hrr-intake",
+              }
+              if TOKEN:
+                  # use the real token
+                  headers["Authorization"] = f"token {TOKEN}"
+              # Try canonical URL then explicit download variant
+              for attempt_url in (url, url + "?download=1"):
+                  r = requests.get(attempt_url, headers=headers, allow_redirects=True, timeout=120)
+                  if r.ok:
+                      dest.parent.mkdir(parents=True, exist_ok=True)
+                      with open(dest, "wb") as f:
+                          f.write(r.content)
+                      return
+              # Final unauth try (for public repos)
+              r = requests.get(url, allow_redirects=True, timeout=120)
+              if r.ok:
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  with open(dest, "wb") as f:
+                      f.write(r.content)
+                  return
+              raise SystemExit(f"Download failed ({r.status_code}) for: {url}")
+
+          csv_block = find_csv_block(body)
+          if not csv_block:
+              print("No CSV block found in issue body.", file=sys.stderr)
+              print("Body preview:", body[:300].replace("\n","\\n"), file=sys.stderr)
+              sys.exit(1)
+
+          # Normalize minor whitespace
+          csv_block = re.sub(r",\s+", ",", csv_block)
+
+          rows = list(csv.DictReader(io.StringIO(csv_block)))
+          if not rows:
+              print("CSV block parsed but contains no rows.", file=sys.stderr); sys.exit(1)
+
+          required = ["ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename"]
+          missing = [h for h in required if h not in rows[0].keys()]
+          if missing:
+              print("CSV header mismatch. Need exactly:", ", ".join(required), file=sys.stderr)
+              sys.exit(1)
+
+          # Attachment links to .csv → map by basename
+          urls = re.findall(r"\((https?://[^\s)]+\.csv)\)", body, flags=re.I)
+          url_map = {pathlib.Path(u.split("?")[0]).name: u for u in urls}
+
+          # Ensure database.xlsx exists
+          xls = pathlib.Path("database.xlsx")
+          if xls.exists():
+              df = pd.read_excel(xls, engine="openpyxl")
+          else:
+              df = pd.DataFrame(columns=[
+                  "ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename",
+                  "ProcessedAt","Peak_kW","Area_kJ","UID","Concise ID"
+              ])
+
+          raw_dir = pathlib.Path("raw_files"); raw_dir.mkdir(parents=True, exist_ok=True)
+
+          # Download attachments using the Filename column
+          for r in rows:
+              for k in required:
+                  if not str(r.get(k, "")).strip():
+                      print(f"Missing field in CSV row: {k}", file=sys.stderr); sys.exit(1)
+              desired = r["Filename"].strip()
+              base = pathlib.Path(desired).name
+              url = url_map.get(base)
+              if not url:
+                  print(f"Attachment for '{desired}' not found among links.", file=sys.stderr); sys.exit(1)
+              dest = raw_dir / desired
+              print(f"Downloading -> {dest}")
+              download_with_auth(url, dest)
+
+          # Append/update rows (unique by ID+Filename)
+          if not {"ProcessedAt","Peak_kW","Area_kJ","UID","Concise ID"}.issubset(df.columns):
+              for c in ["ProcessedAt","UID","Concise ID"]:
+                  if c not in df.columns: df[c] = pd.Series(dtype="string")
+              for c in ["Peak_kW","Area_kJ"]:
+                  if c not in df.columns: df[c] = pd.Series(dtype="float64")
+
+          existing = set(zip(df.get("ID",[]), df.get("Filename",[])))
+          to_add = []
+          for r in rows:
+              pair = (r["ID"], r["Filename"])
+              if pair in existing:
+                  idxs = df.index[(df["ID"]==r["ID"]) & (df["Filename"]==r["Filename"])].tolist()
+                  if idxs:
+                      idx = idxs[0]
+                      for k in ["Scource in IDEEE","Time Unit","Energy Unit","Topic"]:
+                          df.at[idx, k] = r[k]
+              else:
+                  to_add.append(r)
+
+          if to_add:
+              df = pd.concat([df, pd.DataFrame(to_add)], ignore_index=True)
+
+          with pd.ExcelWriter(xls, engine="openpyxl") as xw:
+              df.to_excel(xw, index=False)
+          PY
+
+      - name: Run HRR processor
+        run: |
+          python - << 'PY'
+          import os, subprocess, sys
+          import matplotlib; matplotlib.use("Agg")
+          script = (
+            'hrr_chat.py' if os.path.exists('hrr_chat.py')
+            else ('hrrkit_excel.py' if os.path.exists('hrrkit_excel.py') else None)
+          )
+          if not script:
+            print("Error: neither hrr_chat.py nor hrrkit_excel.py found", file=sys.stderr)
+            sys.exit(1)
+          sys.exit(subprocess.call([sys.executable, script,
+            "--excel","database.xlsx","--raw","raw_files","--base","hrr_database","--quantile","0.90"]))
+          PY
+
+      - name: Ensure output dir for artifact
+        run: mkdir -p hrr_database
+
+      - name: Upload outputs (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: hrr-outputs-issue-${{ steps.payload.outputs.number }}
+          path: |
+            hrr_database/**
+            database.xlsx
+          if-no-files-found: warn
+          retention-days: 10
+
+      - name: Detect auto-commit label
+        id: aclabel
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labels = '${{ steps.payload.outputs.labels }}'
+              .split(',')
+              .map(s => s.trim())
+              .filter(Boolean);
+            core.setOutput('commit', labels.includes('hrr-commit'));
+
+      - name: Commit changes (if labeled hrr-commit)
+        if: ${{ steps.aclabel.outputs.commit == 'true' }}
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "HRR (issue #${{ steps.payload.outputs.number }}): processed inputs [skip ci]"
+            git push
+          else:
+            echo "No changes to commit."
+
+      - name: Comment result on issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const num = Number('${{ steps.payload.outputs.number }}');
+            const artifactName = `hrr-outputs-issue-${num}`;
+            const body = [
+              '✅ HRR intake processed.',
+              '',
+              `- Results attached as workflow artifact: **${artifactName}**`,
+              '- If the issue had the `hrr-commit` label, outputs were committed to the repo.',
+              '',
+              'Re-run this intake by commenting: `/process`'
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: num,
+              body
+            });
