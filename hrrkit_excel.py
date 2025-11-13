@@ -45,12 +45,15 @@ import shutil
 import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple, Dict, Any, Set
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import requests
+import isbnlib
 
 
 # ----------------------------- Configuration --------------------------------
@@ -88,6 +91,121 @@ ENERGY_UNIT_MAP = {
 }
 TIME_MULTIPLIER = {"sec": 1.0, "min": 60.0}
 POWER_MULTIPLIER = {"kw": 1.0, "mw": 1000.0}
+
+
+# -------------------------- IEEE source formatting ---------------------------
+
+DOI_ACCEPT_HEADER = {"Accept": "text/x-bibliography; style=ieee"}
+DOI_PREFIXES = (
+    "doi:", "doi.org/", "https://doi.org/", "http://doi.org/",
+    "https://dx.doi.org/", "http://dx.doi.org/",
+)
+ISBN_PREFIXES = ("isbn:", "isbn-10:", "isbn-13:", "isbn ", "isbn")
+
+
+def _normalize_doi(doi_value: str) -> str:
+    doi_value = (doi_value or "").strip()
+    return doi_value.strip().strip(" .;")
+
+
+def _canonicalize_isbn(isbn_value: str) -> str:
+    value = (isbn_value or "").strip()
+    if not value:
+        return ""
+    try:
+        canonical = isbnlib.canonical(value)
+    except Exception:
+        canonical = re.sub(r"[^0-9Xx]", "", value)
+    return canonical.upper()
+
+
+def _is_valid_isbn(isbn_value: str) -> bool:
+    if not isbn_value:
+        return False
+    return isbnlib.is_isbn13(isbn_value) or isbnlib.is_isbn10(isbn_value)
+
+
+def _extract_source_identifier(value: str) -> Tuple[Optional[str], Optional[str]]:
+    raw = (value or "").strip()
+    if not raw:
+        return None, None
+
+    lower = raw.lower()
+    for prefix in DOI_PREFIXES:
+        if lower.startswith(prefix):
+            candidate = raw[len(prefix):].strip()
+            candidate = _normalize_doi(candidate)
+            if candidate:
+                return "doi", candidate
+    if lower.startswith("10.") and "/" in raw:
+        candidate = _normalize_doi(raw)
+        return "doi", candidate
+
+    for prefix in ISBN_PREFIXES:
+        if lower.startswith(prefix):
+            candidate = _canonicalize_isbn(raw[len(prefix):])
+            if candidate and _is_valid_isbn(candidate):
+                return "isbn", candidate
+
+    candidate = _canonicalize_isbn(raw)
+    if candidate and _is_valid_isbn(candidate):
+        return "isbn", candidate
+
+    return None, None
+
+
+@lru_cache(maxsize=256)
+def _ieee_from_doi(doi_value: str) -> str:
+    url = requests.utils.requote_uri(f"https://doi.org/{doi_value}")
+    resp = requests.get(url, headers=DOI_ACCEPT_HEADER, timeout=15)
+    resp.raise_for_status()
+    citation = resp.text.strip()
+    if not citation:
+        raise ValueError(f"Empty response for DOI '{doi_value}'")
+    return citation
+
+
+@lru_cache(maxsize=256)
+def _ieee_from_isbn(isbn_value: str) -> str:
+    meta = isbnlib.meta(isbn_value)
+    if not meta:
+        raise ValueError(f"No metadata returned for ISBN '{isbn_value}'")
+    authors = meta.get("Authors", []) or []
+    first_author = authors[0] if authors else ""
+    title = meta.get("Title", "")
+    publisher = meta.get("Publisher", meta.get("PublisherName", ""))
+    year = meta.get("Year", "")
+
+    parts: List[str] = []
+    if first_author:
+        parts.append(first_author.replace(",", ""))
+    if title:
+        parts.append(title)
+    if publisher:
+        parts.append(publisher)
+    if year:
+        parts.append(str(year))
+
+    if not parts:
+        raise ValueError(f"Insufficient metadata for ISBN '{isbn_value}'")
+
+    return ", ".join(parts) + "."
+
+
+def convert_source_to_ieee(source_value: str) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+    """Return (value, type, identifier, error)."""
+    src_type, identifier = _extract_source_identifier(source_value)
+    if not src_type or not identifier:
+        return source_value, None, None, None
+
+    try:
+        if src_type == "doi":
+            citation = _ieee_from_doi(identifier)
+        else:
+            citation = _ieee_from_isbn(identifier)
+        return citation, src_type, identifier, None
+    except Exception as exc:  # noqa: BLE001 - surface the original reason upstream
+        return source_value, src_type, identifier, str(exc)
 
 
 # ------------------------------ Path helpers --------------------------------
@@ -522,7 +640,7 @@ def process_row_to_files(
       (stats or None, error or None, topic or None, meta for registry/database or None)
     """
     row_id = str(row["ID"]).strip()
-    ideee = str(row["Scource in IDEEE"]).strip()
+    ideee_input = str(row["Scource in IDEEE"]).strip()
     topic = str(row["Topic"]).strip()
     time_unit = str(row["Time Unit"]).strip()
     energy_unit = str(row["Energy Unit"]).strip()
@@ -531,7 +649,14 @@ def process_row_to_files(
     if not (row_id and topic and time_unit and energy_unit and filename):
         return None, "Missing required fields", None, None
 
-    concise_id, uid6 = make_concise_id_and_uid(row_id, ideee)
+    concise_id, uid6 = make_concise_id_and_uid(row_id, ideee_input)
+    ideee_formatted, src_type, identifier, conv_error = convert_source_to_ieee(ideee_input)
+    if src_type:
+        if conv_error:
+            print(f"    [warning] Could not convert {src_type.upper()} '{identifier}': {conv_error}")
+        else:
+            print(f"    Source interpreted as {src_type.upper()} '{identifier}' → IEEE reference.")
+    ideee = ideee_formatted
     time_unit_norm = normalize_time_unit(time_unit)
     energy_unit_norm = normalize_energy_unit(energy_unit)
     if not time_unit_norm or not energy_unit_norm:
@@ -866,6 +991,7 @@ def main() -> None:
         db_df.at[idx, "ProcessedAt"] = pd.Series([now_str], dtype="string").iloc[0]
         db_df.at[idx, "UID"] = pd.Series([meta["UID"]], dtype="string").iloc[0]
         db_df.at[idx, "Concise ID"] = pd.Series([meta["concise_id"]], dtype="string").iloc[0]
+        db_df.at[idx, "Scource in IDEEE"] = pd.Series([meta["IDEEE"]], dtype="string").iloc[0]
         db_df.at[idx, "Peak_kW"] = float(stats["Peak_kW"])
         db_df.at[idx, "Area_kJ"]  = float(stats["Area_kJ"])
 
