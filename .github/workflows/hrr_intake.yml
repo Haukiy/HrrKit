@@ -122,6 +122,61 @@ jobs:
                   break
               return "\n".join(out).strip()
 
+          def normalize_key(name: str) -> str:
+              return re.sub(r"\s+", " ", name.strip().lower())
+
+          def parse_structured_blocks(text: str):
+              """Parse the block format from the issue template when CSV isn't provided."""
+              key_map = {
+                  "id": "ID",
+                  "scource in ideee": "Scource in IDEEE",
+                  "source in ideee": "Scource in IDEEE",
+                  "topic": "Topic",
+                  "filename (save as)": "Filename",
+                  "filename save as": "Filename",
+                  "filename": "Filename",
+                  "time unit": "Time Unit",
+                  "energy unit": "Energy Unit",
+                  "attachment filename": "__attachment_hint__",
+                  "attachment file name": "__attachment_hint__",
+              }
+
+              required = ["ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename"]
+              rows = []
+              current = {}
+
+              def flush():
+                  nonlocal current
+                  if any(current.get(k) for k in required):
+                      rows.append(current)
+                  current = {}
+
+              for line in text.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      flush()
+                      continue
+                  if stripped.startswith("###") or stripped.startswith("**"):
+                      continue
+                  if ":" not in stripped:
+                      continue
+                  key, value = stripped.split(":", 1)
+                  canonical = key_map.get(normalize_key(key))
+                  if not canonical:
+                      continue
+                  if canonical == "ID" and current and any(current.values()):
+                      flush()
+                  current[canonical] = value.strip()
+              flush()
+
+              parsed = []
+              for entry in rows:
+                  if all(entry.get(k, "").strip() for k in required):
+                      row = {k: entry.get(k, "").strip() for k in required}
+                      row["__attachment_hint__"] = entry.get("__attachment_hint__", "").strip()
+                      parsed.append(row)
+              return parsed
+
           def extract_inline_files(text: str) -> dict:
               """
               Allow embedding raw files directly in the issue:
@@ -177,15 +232,20 @@ jobs:
 
           # ---------- Parse DB rows ----------
           csv_block = find_csv_block(body)
-          if not csv_block:
-              print("No CSV block found in issue body.", file=sys.stderr)
-              print("Body preview:", body[:300].replace("\n","\\n"), file=sys.stderr)
-              sys.exit(1)
-
-          csv_block = re.sub(r",\s+", ",", csv_block)
-          rows = list(csv.DictReader(io.StringIO(csv_block)))
-          if not rows:
-              print("CSV block parsed but contains no rows.", file=sys.stderr); sys.exit(1)
+          rows = []
+          if csv_block:
+              csv_block = re.sub(r",\s+", ",", csv_block)
+              rows = list(csv.DictReader(io.StringIO(csv_block)))
+              if not rows:
+                  print("CSV block parsed but contains no rows.", file=sys.stderr); sys.exit(1)
+              for r in rows:
+                  r["__attachment_hint__"] = ""
+          else:
+              rows = parse_structured_blocks(body)
+              if not rows:
+                  print("No CSV block or structured entry blocks found in issue body.", file=sys.stderr)
+                  print("Body preview:", body[:300].replace("\n","\\n"), file=sys.stderr)
+                  sys.exit(1)
 
           required = ["ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename"]
           missing = [h for h in required if h not in rows[0].keys()]
@@ -197,6 +257,12 @@ jobs:
           urls = re.findall(r"\((https?://[^\s)]+\.csv)\)", body, flags=re.I)
           url_map = {pathlib.Path(u.split("?")[0]).name: u for u in urls}
           inline_files = extract_inline_files(body)  # {"filename.csv": "content\n", ...}
+
+          def clean_attachment_name(name: str) -> str:
+              name = (name or "").strip()
+              name = re.sub(r"\s*\(.*?\)\s*$", "", name)
+              name = name.strip()
+              return pathlib.Path(name).name if name else ""
 
           # ---------- Ensure database.csv ----------
           csv_path = pathlib.Path("database.csv")
@@ -219,11 +285,18 @@ jobs:
               desired = r["Filename"].strip()
               base = pathlib.Path(desired).name
               dest = raw_dir / desired
+              attachment_hint = clean_attachment_name(r.get("__attachment_hint__", ""))
 
               have = False
               if base in url_map:
                   print(f"Attempting download -> {dest}")
                   have = download_with_auth(url_map[base], dest)
+
+              if not have and attachment_hint:
+                  hint_base = pathlib.Path(attachment_hint).name
+                  if hint_base in url_map:
+                      print(f"Attempting download via attachment hint '{hint_base}' -> {dest}")
+                      have = download_with_auth(url_map[hint_base], dest)
 
               if not have and base in inline_files:
                   print(f"Writing inline file -> {dest}")
@@ -231,6 +304,8 @@ jobs:
                   with open(dest, "w", newline="") as f:
                       f.write(inline_files[base])
                   have = True
+
+              r.pop("__attachment_hint__", None)
 
               if not have:
                   print(f"Could not obtain '{desired}'.", file=sys.stderr)
