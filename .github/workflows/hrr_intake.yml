@@ -170,11 +170,22 @@ jobs:
               flush()
 
               parsed = []
-              for entry in rows:
-                  if all(entry.get(k, "").strip() for k in required):
-                      row = {k: entry.get(k, "").strip() for k in required}
-                      row["__attachment_hint__"] = entry.get("__attachment_hint__", "").strip()
-                      parsed.append(row)
+              incomplete_blocks = []
+              for idx, entry in enumerate(rows, start=1):
+                  missing = [k for k in required if not entry.get(k, "").strip()]
+                  if missing:
+                      block_id = entry.get("ID", "").strip()
+                      label = f"Entry #{idx}" + (f" (ID: {block_id})" if block_id else "")
+                      incomplete_blocks.append(f"  - {label} missing: {', '.join(missing)}")
+                      continue
+                  row = {k: entry.get(k, "").strip() for k in required}
+                  row["__attachment_hint__"] = entry.get("__attachment_hint__", "").strip()
+                  parsed.append(row)
+
+              if incomplete_blocks:
+                  message = ["Incomplete structured block(s) detected:"] + incomplete_blocks
+                  raise ValueError("\n".join(message))
+
               return parsed
 
           def extract_inline_files(text: str) -> dict:
@@ -241,7 +252,11 @@ jobs:
               for r in rows:
                   r["__attachment_hint__"] = ""
           else:
-              rows = parse_structured_blocks(body)
+              try:
+                  rows = parse_structured_blocks(body)
+              except ValueError as exc:
+                  print(str(exc), file=sys.stderr)
+                  sys.exit(1)
               if not rows:
                   print("No CSV block or structured entry blocks found in issue body.", file=sys.stderr)
                   print("Body preview:", body[:300].replace("\n","\\n"), file=sys.stderr)
