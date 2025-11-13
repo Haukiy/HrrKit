@@ -1,11 +1,4 @@
-# HrrKit utilities
-
-This repository contains scripts that support the HRRkit workflow. The main entry
-point is `hrrkit_excel.py`, which ingests the `database.csv` table, moves raw
-curves into the canonical folder structure, and produces the derived outputs
-listed in the module docstring.
-
-## IEEE source formatting inside `database.csv`
+## IEEE source formatting 
 
 The `Scource in IDEEE` column accepts either a fully formatted IEEE reference or
 an identifier that the script can expand on your behalf:
@@ -18,9 +11,3 @@ replaces the `Scource in IDEEE` value with an IEEE-formatted reference. This
 updated value is stored in `database.csv`, the per-topic source registry, and the
 plot captions, so the user only has to provide the DOI/ISBN once.
 
-Network access is required for DOI lookups, while ISBN metadata is collected via
-[`isbnlib`](https://pypi.org/project/isbnlib/). Install the dependencies with:
-
-```bash
-pip install requests isbnlib
-```
