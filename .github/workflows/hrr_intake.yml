@@ -122,6 +122,71 @@ jobs:
                   break
               return "\n".join(out).strip()
 
+          def extract_issue_section(text: str, heading: str) -> str:
+              heading_norm = re.sub(r"\s+", " ", heading.strip().lower().lstrip('#').strip())
+              lines = text.splitlines()
+              start = None
+              for i, line in enumerate(lines):
+                  candidate = re.sub(r"\s+", " ", line.strip().lower().lstrip('#').strip())
+                  if not candidate:
+                      continue
+                  if candidate == heading_norm:
+                      start = i + 1
+                      break
+              if start is None:
+                  return text
+              end = len(lines)
+              for j in range(start, len(lines)):
+                  if lines[j].strip().startswith("###"):
+                      end = j
+                      break
+                  if re.sub(r"\s+", " ", lines[j].strip().lower().lstrip('#').strip()) == heading_norm:
+                      end = j
+                      break
+              return "\n".join(lines[start:end]).strip()
+
+          def parse_labeled_blocks(text: str):
+              section = extract_issue_section(text, "File details for database.csv")
+              label_map = {
+                  "id": "ID",
+                  "scource in ideee": "Scource in IDEEE",
+                  "topic": "Topic",
+                  "time unit": "Time Unit",
+                  "energy unit": "Energy Unit",
+              }
+              rows = []
+              current = {}
+
+              def push_current():
+                  nonlocal current
+                  if current:
+                      rows.append(current)
+                      current = {}
+
+              for line in section.splitlines():
+                  stripped = line.strip()
+                  if not stripped:
+                      push_current()
+                      continue
+                  m = re.match(r"([^:]+):\s*(.*)$", stripped)
+                  if not m:
+                      continue
+                  label = re.sub(r"\s+", " ", m.group(1).strip().lower())
+                  value = m.group(2).strip()
+                  if label in label_map:
+                      current[label_map[label]] = value
+                  elif label.startswith("filename (save as"):
+                      current["Filename"] = value
+                  elif label == "filename":
+                      current["Filename"] = value
+                  elif label.startswith("attachment filename"):
+                      current["__attachment_filename"] = value
+                  elif label.startswith("attachment file"):
+                      current["__attachment_filename"] = value
+
+              push_current()
+              return rows
+
           def extract_inline_files(text: str) -> dict:
               """
               Allow embedding raw files directly in the issue:
@@ -177,20 +242,21 @@ jobs:
 
           # ---------- Parse DB rows ----------
           csv_block = find_csv_block(body)
-          if not csv_block:
-              print("No CSV block found in issue body.", file=sys.stderr)
+          if csv_block:
+              csv_block = re.sub(r",\s+", ",", csv_block)
+              rows = list(csv.DictReader(io.StringIO(csv_block)))
+          else:
+              rows = parse_labeled_blocks(body)
+
+          if not rows:
+              print("No recognizable submission block found in issue body.", file=sys.stderr)
               print("Body preview:", body[:300].replace("\n","\\n"), file=sys.stderr)
               sys.exit(1)
-
-          csv_block = re.sub(r",\s+", ",", csv_block)
-          rows = list(csv.DictReader(io.StringIO(csv_block)))
-          if not rows:
-              print("CSV block parsed but contains no rows.", file=sys.stderr); sys.exit(1)
 
           required = ["ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename"]
           missing = [h for h in required if h not in rows[0].keys()]
           if missing:
-              print("CSV header mismatch. Need exactly:", ", ".join(required), file=sys.stderr)
+              print("Submission missing required fields. Need:", ", ".join(required), file=sys.stderr)
               sys.exit(1)
 
           # ---------- Attachments + Inline file map ----------
@@ -211,6 +277,7 @@ jobs:
           raw_dir = pathlib.Path("raw_files"); raw_dir.mkdir(parents=True, exist_ok=True)
 
           # ---------- For each row, ensure the raw file exists (download or inline) ----------
+          cleaned_rows = []
           for r in rows:
               for k in required:
                   if not str(r.get(k, "")).strip():
@@ -219,24 +286,30 @@ jobs:
               desired = r["Filename"].strip()
               base = pathlib.Path(desired).name
               dest = raw_dir / desired
+              attachment_name = r.get("__attachment_filename") or base
+              attachment_base = pathlib.Path(attachment_name).name
 
               have = False
-              if base in url_map:
+              if attachment_base in url_map:
                   print(f"Attempting download -> {dest}")
-                  have = download_with_auth(url_map[base], dest)
+                  have = download_with_auth(url_map[attachment_base], dest)
 
-              if not have and base in inline_files:
+              if not have and attachment_base in inline_files:
                   print(f"Writing inline file -> {dest}")
                   dest.parent.mkdir(parents=True, exist_ok=True)
                   with open(dest, "w", newline="") as f:
-                      f.write(inline_files[base])
+                      f.write(inline_files[attachment_base])
                   have = True
 
               if not have:
                   print(f"Could not obtain '{desired}'.", file=sys.stderr)
                   print("Either attach the CSV or embed it as a code block like:", file=sys.stderr)
-                  print("```csv filename=" + base + "\\n<your csv content>\\n```", file=sys.stderr)
+                  print("```csv filename=" + attachment_base + "\\n<your csv content>\\n```", file=sys.stderr)
                   sys.exit(1)
+
+              cleaned_rows.append({k: v for k, v in r.items() if not k.startswith("__")})
+
+          rows = cleaned_rows
 
           # ---------- Append/update DB rows ----------
           if SUBMISSION_COL not in df.columns:
