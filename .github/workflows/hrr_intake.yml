@@ -2,9 +2,9 @@ name: HRR Intake (Issues)
 
 on:
   issues:
-    types: [labeled]           # <-- only on label add (prevents double-runs)
+    types: [labeled]           # run only when a label is added
   issue_comment:
-    types: [created]           # allow /process re-run
+    types: [created]           # allow /process or /intake-commit re-runs
   workflow_dispatch:           # manual run from Actions UI
 
 permissions:
@@ -15,14 +15,16 @@ jobs:
   run:
     # Run when:
     #  - issue is labeled 'hrr-intake'
-    #  - someone comments '/process'
+    #  - someone comments '/process' or '/intake-commit'
     #  - manual dispatch
     if: >
       (github.event_name == 'issues' &&
        github.event.action == 'labeled' &&
        contains(join(github.event.issue.labels.*.name, ','), 'hrr-intake')) ||
-      (github.event_name == 'issue_comment' &&
-       startsWith(github.event.comment.body, '/process')) ||
+      (github.event_name == 'issue_comment' && (
+         startsWith(github.event.comment.body, '/process') ||
+         startsWith(github.event.comment.body, '/intake-commit')
+      )) ||
       (github.event_name == 'workflow_dispatch')
 
     runs-on: ubuntu-latest
@@ -61,6 +63,16 @@ jobs:
             core.setOutput('body', issue.body ?? '');
             core.setOutput('labels', (issue.labels ?? []).map(l => l.name).join(','));
 
+      - name: Detect commit trigger from comment
+        id: trig
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const isComment = context.eventName === 'issue_comment';
+            const body = isComment ? (context.payload.comment?.body || '') : '';
+            const commitFromComment = isComment && body.trim().startsWith('/intake-commit');
+            core.setOutput('commit_from_comment', commitFromComment ? 'true' : 'false');
+
       - name: Prepare raw_files, parse CSV from issue, pull files (attachments or inline), update Excel
         env:
           ISSUE_BODY: ${{ steps.payload.outputs.body }}
@@ -78,42 +90,31 @@ jobs:
 
           # ---------- Helpers ----------
           def find_csv_block(text: str) -> str:
-              # 1) Prefer fenced code block ```csv ... ``` (or any ``` ... ```)
+              # Prefer fenced code block ```csv ... ```
               m = re.search(r"```(?:csv)?\s*([\s\S]*?)\s*```", text, flags=re.I)
               if m:
                   return m.group(1).strip()
-
-              # 2) Fallback: locate header anywhere, then collect CSV-looking lines
+              # Fallback: locate header anywhere, then collect CSV-looking lines
               lines = text.splitlines()
               canonical = "id,scource in ideee,time unit,energy unit,topic,filename"
               canonical_nospace = re.sub(r"\s+", "", canonical)
-
               start = None
               for i, line in enumerate(lines):
                   raw = line.strip().lower()
-                  if not raw:
-                      continue
+                  if not raw: continue
                   norm = re.sub(r"\s*,\s*", ",", raw)
                   if norm == canonical or re.sub(r"\s+", "", raw) == canonical_nospace:
                       start = i; break
-              if start is None:
-                  return ""
-
+              if start is None: return ""
               out = [re.sub(r"\s*,\s*", ",", lines[start].strip())]
               for j in range(start+1, len(lines)):
                   s = lines[j]
-                  if not s.strip():
-                      break
+                  if not s.strip(): break
                   cnt = s.count(",")
-                  # data rows usually have ≥5 commas; accept "n,..." rows as well
                   if cnt >= 5 or (re.match(r"^\s*\d+\s*,", s) and cnt >= 5):
-                      out.append(re.sub(r"\s*,\s*", ",", s.strip()))
-                      continue
-                  # stop at attachments/links/other sections
-                  if s.lstrip().startswith("[") or s.lstrip().startswith("http"):
-                      break
-                  if s.lstrip().startswith("#") or "Notes (optional)" in s or "Attachments" in s:
-                      break
+                      out.append(re.sub(r"\s*,\s*", ",", s.strip())); continue
+                  if s.lstrip().startswith("[") or s.lstrip().startswith("http"): break
+                  if s.lstrip().startswith("#") or "Notes (optional)" in s or "Attachments" in s: break
                   break
               return "\n".join(out).strip()
 
@@ -134,31 +135,21 @@ jobs:
                   info = (m.group(1) or "").strip()
                   content = m.group(2)
                   filename = None
-
                   mfn = re.search(r"filename\s*=\s*([^\s]+)", info, flags=re.I)
                   if mfn:
                       filename = mfn.group(1).strip()
-
                   if not filename:
                       first_line, *rest = content.splitlines()
                       mline = re.search(r"^\s*(?:#\s*)?file\s*:\s*(.+)$", first_line.strip(), flags=re.I)
                       if mline:
                           filename = mline.group(1).strip()
                           content = "\n".join(rest) + ("\n" if rest else "")
-
                   if filename:
                       files[pathlib.Path(filename).name] = content
               return files
 
           def download_with_auth(url: str, dest: pathlib.Path) -> bool:
-              """
-              Try to download with auth (public repos: succeeds without; private issue attachments may still 404).
-              Returns True if saved, False otherwise.
-              """
-              headers = {
-                  "Accept": "application/octet-stream",
-                  "User-Agent": "gh-actions-hrr-intake",
-              }
+              headers = {"Accept": "application/octet-stream", "User-Agent": "gh-actions-hrr-intake"}
               if TOKEN:
                   headers["Authorization"] = f"token {TOKEN}"
               for attempt_url in (url, url + "?download=1"):
@@ -166,18 +157,15 @@ jobs:
                       r = requests.get(attempt_url, headers=headers, allow_redirects=True, timeout=120)
                       if r.ok:
                           dest.parent.mkdir(parents=True, exist_ok=True)
-                          with open(dest, "wb") as f:
-                              f.write(r.content)
+                          with open(dest, "wb") as f: f.write(r.content)
                           return True
                   except Exception:
                       pass
-              # final unauth try (public)
               try:
                   r = requests.get(url, allow_redirects=True, timeout=120)
                   if r.ok:
                       dest.parent.mkdir(parents=True, exist_ok=True)
-                      with open(dest, "wb") as f:
-                          f.write(r.content)
+                      with open(dest, "wb") as f: f.write(r.content)
                       return True
               except Exception:
                   pass
@@ -228,13 +216,11 @@ jobs:
               base = pathlib.Path(desired).name
               dest = raw_dir / desired
 
-              # 1) Try attachment download (works for public; often 404 for private)
               have = False
               if base in url_map:
                   print(f"Attempting download -> {dest}")
                   have = download_with_auth(url_map[base], dest)
 
-              # 2) If download failed or no URL, try inline file block
               if not have and base in inline_files:
                   print(f"Writing inline file -> {dest}")
                   dest.parent.mkdir(parents=True, exist_ok=True)
@@ -244,7 +230,7 @@ jobs:
 
               if not have:
                   print(f"Could not obtain '{desired}'.", file=sys.stderr)
-                  print("Either attach the CSV (public repo) or embed it as a code block like:", file=sys.stderr)
+                  print("Either attach the CSV or embed it as a code block like:", file=sys.stderr)
                   print("```csv filename=" + base + "\\n<your csv content>\\n```", file=sys.stderr)
                   sys.exit(1)
 
@@ -304,19 +290,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 10
 
-      - name: Detect auto-commit label
-        id: aclabel
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const labels = '${{ steps.payload.outputs.labels }}'
-              .split(',')
-              .map(s => s.trim())
-              .filter(Boolean);
-            core.setOutput('commit', labels.includes('hrr-commit'));
-
-      - name: Commit changes (if labeled hrr-commit)
-        if: ${{ steps.aclabel.outputs.commit == 'true' }}
+      - name: Commit changes (only when comment is /intake-commit)
+        if: ${{ steps.trig.outputs.commit_from_comment == 'true' }}
         shell: bash
         run: |
           set -e
@@ -326,7 +301,7 @@ jobs:
 
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
-            git commit -m "HRR (issue #${{ steps.payload.outputs.number }}): processed inputs [skip ci]"
+            git commit -m "HRR intake (issue #${{ steps.payload.outputs.number }}): processed inputs [skip ci]"
             git push
           else
             echo "No changes to commit."
@@ -338,24 +313,20 @@ jobs:
           script: |
             const num = Number('${{ steps.payload.outputs.number }}');
             const artifactName = `hrr-outputs-issue-${num}`;
-            const body = [
-              '✅ HRR intake processed.',
+            const commitTriggered = '${{ steps.trig.outputs.commit_from_comment }}' === 'true';
+            const lines = [
+              '✅ HRR intake check completed.',
               '',
               `- Results attached as workflow artifact: **${artifactName}**`,
-              '- If the issue had the `hrr-commit` label, outputs were committed to the repo.',
+              commitTriggered
+                ? '- Outputs were committed to the repository.'
+                : '- To commit these results to the repository, comment: **`/intake-commit`**',
               '',
-              'Re-run this intake by commenting: `/process`',
-              '',
-              'Tip for private repos: if attachment downloads fail, embed raw CSV files like:',
-              '```csv filename=CAR_2010_Test01_raw.csv',
-              'time,value',
-              '0,0',
-              '10,123',
-              '```'
-            ].join('\n');
+              'Re-run this check by commenting: **`/process`**'
+            ];
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: num,
-              body
+              body: lines.join('\n')
             });
