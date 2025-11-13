@@ -76,6 +76,7 @@ jobs:
       - name: Prepare raw_files, parse CSV from issue, pull files (attachments or inline), update Excel
         env:
           ISSUE_BODY: ${{ steps.payload.outputs.body }}
+          ISSUE_NUMBER: ${{ steps.payload.outputs.number }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
@@ -86,7 +87,10 @@ jobs:
           import pandas as pd
 
           body = os.environ.get("ISSUE_BODY","")
+          issue_number = os.environ.get("ISSUE_NUMBER","" ).strip()
+          run_id = os.environ.get("GITHUB_RUN_ID","" ).strip()
           TOKEN = os.environ.get("GITHUB_TOKEN","").strip()
+          SUBMISSION_COL = "SubmissionKey"
 
           # ---------- Helpers ----------
           def find_csv_block(text: str) -> str:
@@ -201,7 +205,7 @@ jobs:
           else:
               df = pd.DataFrame(columns=[
                   "ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename",
-                  "ProcessedAt","Peak_kW","Area_kJ","UID","Concise ID"
+                  "ProcessedAt","Peak_kW","Area_kJ","UID","Concise ID", SUBMISSION_COL
               ])
 
           raw_dir = pathlib.Path("raw_files"); raw_dir.mkdir(parents=True, exist_ok=True)
@@ -235,24 +239,51 @@ jobs:
                   sys.exit(1)
 
           # ---------- Append/update DB rows ----------
+          if SUBMISSION_COL not in df.columns:
+              df[SUBMISSION_COL] = pd.Series(dtype="string")
+          elif str(df[SUBMISSION_COL].dtype) != "string":
+              df[SUBMISSION_COL] = df[SUBMISSION_COL].astype("string")
+
           if not {"ProcessedAt","Peak_kW","Area_kJ","UID","Concise ID"}.issubset(df.columns):
               for c in ["ProcessedAt","UID","Concise ID"]:
                   if c not in df.columns: df[c] = pd.Series(dtype="string")
               for c in ["Peak_kW","Area_kJ"]:
                   if c not in df.columns: df[c] = pd.Series(dtype="float64")
 
-          existing = set(zip(df.get("ID",[]), df.get("Filename",[])))
+          # Submission keys ensure reruns of the same issue rows update instead of duplicating
+          if issue_number:
+              prefix = f"issue-{issue_number}"
+          elif run_id:
+              prefix = f"run-{run_id}"
+          else:
+              prefix = "manual"
+
+          prepared_rows = []
+          for idx, r in enumerate(rows, start=1):
+              r = dict(r)
+              r[SUBMISSION_COL] = f"{prefix}-row-{idx}"
+              prepared_rows.append(r)
+
+          existing_keys = set(
+              key
+              for key in (
+                  str(val).strip()
+                  for val in df[SUBMISSION_COL].astype(str).tolist()
+              )
+              if key and key.lower() != "nan"
+          )
+
           to_add = []
-          for r in rows:
-              pair = (r["ID"], r["Filename"])
-              if pair in existing:
-                  idxs = df.index[(df["ID"]==r["ID"]) & (df["Filename"]==r["Filename"])].tolist()
-                  if idxs:
-                      idx = idxs[0]
-                      for k in ["Scource in IDEEE","Time Unit","Energy Unit","Topic"]:
-                          df.at[idx, k] = r[k]
+          for r in prepared_rows:
+              key = str(r.get(SUBMISSION_COL,"" )).strip()
+              if key and key in existing_keys:
+                  mask = (df[SUBMISSION_COL] == key)
+                  for k in ["ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename"]:
+                      df.loc[mask, k] = r[k]
               else:
                   to_add.append(r)
+                  if key:
+                      existing_keys.add(key)
 
           if to_add:
               df = pd.concat([df, pd.DataFrame(to_add)], ignore_index=True)

@@ -372,6 +372,28 @@ def make_concise_id_and_uid(id_str: str, ideee: str, max_total_len: int = 40) ->
     return base[:max_total_len], uid6
 
 
+def ensure_unique_concise_id(
+    base_concise_id: str,
+    paths: TopicPaths,
+    time_unit_norm: str,
+    energy_unit_norm: str,
+) -> Tuple[str, bool]:
+    """Return a concise_id that does not collide with existing files."""
+
+    candidate = base_concise_id
+    counter = 2
+    def _has_conflict(name: str) -> bool:
+        raw_name = paths.curves_raw / f"{name}_{time_unit_norm}_{energy_unit_norm}_raw.csv"
+        clean_name = paths.curves_clean / f"{name}.csv"
+        shape_name = paths.shape_curves / f"{name}_shape.csv"
+        return raw_name.exists() or clean_name.exists() or shape_name.exists()
+
+    while _has_conflict(candidate):
+        candidate = f"{base_concise_id}_v{counter:02d}"
+        counter += 1
+    return candidate, candidate != base_concise_id
+
+
 # ----------------------------- Curve processing ------------------------------
 
 def normalise_curve_seconds_kw(
@@ -501,6 +523,11 @@ def process_row_to_files(
 
     # Prepare topic directories
     paths = ensure_topic_structure(base_dir, topic)
+
+    # Ensure we do not overwrite previous submissions (same ID/IDEEE)
+    concise_id, renamed = ensure_unique_concise_id(concise_id, paths, time_unit_norm, energy_unit_norm)
+    if renamed:
+        print(f"    Concise ID already present, storing as '{concise_id}'.")
 
     # Move raw → curves_raw with canonical name
     canonical_raw_name = f"{concise_id}_{time_unit_norm}_{energy_unit_norm}_raw.csv"
