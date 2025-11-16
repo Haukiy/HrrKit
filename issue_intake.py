@@ -56,9 +56,19 @@ def find_csv_block(text: str) -> str:
             continue
         if "filename=" in info_string:
             continue
-        if info_string and info_string not in ("csv",):
+        has_csv_language = False
+        for token in re.split(r"\s+", info_string):
+            if token in ("csv", "text/csv"):
+                has_csv_language = True
+                break
+        if info_string and not has_csv_language:
             continue
         first_line = block.splitlines()[0].strip().lower()
+        if not has_csv_language and "," not in first_line:
+            # Without an explicit csv info string we only consider blocks that
+            # look like comma-separated data. This skips the instructional code
+            # block found in the intake issue template.
+            continue
         if re.match(r"^(?:#\s*)?file\s*:", first_line):
             continue
         return block
@@ -156,12 +166,17 @@ def parse_structured_blocks(text: str) -> List[Dict[str, str]]:
             flush_current()
         current[canonical] = value.strip()
     flush_current()
+    placeholder_pattern = re.compile(r"<[^>]+>")
     parsed = []
     for entry in rows:
-        if all(entry.get(field, "").strip() for field in REQUIRED_FIELDS):
-            normalized = {field: entry.get(field, "").strip() for field in REQUIRED_FIELDS}
-            normalized["__attachment_hint__"] = entry.get("__attachment_hint__", "").strip()
-            parsed.append(normalized)
+        if not all(entry.get(field, "").strip() for field in REQUIRED_FIELDS):
+            continue
+        normalized = {field: entry.get(field, "").strip() for field in REQUIRED_FIELDS}
+        if any(placeholder_pattern.search(normalized[field]) for field in REQUIRED_FIELDS):
+            # Skip template/example blocks copied from the instructions section.
+            continue
+        normalized["__attachment_hint__"] = entry.get("__attachment_hint__", "").strip()
+        parsed.append(normalized)
     return parsed
 
 
