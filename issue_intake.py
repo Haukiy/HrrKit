@@ -13,8 +13,8 @@ import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import pandas as pd
-import requests
+import urllib.error
+import urllib.request
 
 DEFAULT_DATABASE = "database.csv"
 DEFAULT_RAW_DIR = "raw_files"
@@ -48,9 +48,20 @@ def _normalize_csv_header(value: str) -> str:
 def find_csv_block(text: str) -> str:
     """Return the first CSV-looking fenced block found in the text."""
 
-    match = re.search(r"```(?:csv)?\s*([\s\S]*?)\s*```", text, flags=re.I)
-    if match:
-        return match.group(1).strip()
+    fence_pattern = re.compile(r"```([^\n]*)\n([\s\S]*?)```", flags=re.I)
+    for match in fence_pattern.finditer(text):
+        info_string = (match.group(1) or "").strip().lower()
+        block = (match.group(2) or "").strip()
+        if not block:
+            continue
+        if "filename=" in info_string:
+            continue
+        if info_string and info_string not in ("csv",):
+            continue
+        first_line = block.splitlines()[0].strip().lower()
+        if re.match(r"^(?:#\s*)?file\s*:", first_line):
+            continue
+        return block
 
     lines = text.splitlines()
     canonical_headers = [
@@ -216,24 +227,33 @@ def download_with_auth(url: str, dest: pathlib.Path, token: str) -> bool:
     headers = {"Accept": "application/octet-stream", "User-Agent": "hrr-issue-intake"}
     if token:
         headers["Authorization"] = f"token {token}"
-    for attempt_url in (url, url + "?download=1"):
+
+    def attempt_download(target_url: str, extra_headers: Optional[Dict[str, str]] = None) -> Optional[bytes]:
+        combined_headers = dict(headers)
+        if extra_headers:
+            combined_headers.update(extra_headers)
+        request = urllib.request.Request(target_url, headers=combined_headers)
         try:
-            resp = requests.get(attempt_url, headers=headers, allow_redirects=True, timeout=120)
-            if resp.ok:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(resp.content)
-                return True
-        except Exception:
-            pass
-    try:
-        resp = requests.get(url, allow_redirects=True, timeout=120)
-        if resp.ok:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.read()
+        except (urllib.error.URLError, urllib.error.HTTPError):
+            return None
+
+    for attempt_url in (url, url + "?download=1"):
+        data = attempt_download(attempt_url)
+        if data is not None:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(resp.content)
+            dest.write_bytes(data)
             return True
-    except Exception:
-        pass
-    return False
+
+    try:
+        with urllib.request.urlopen(url, timeout=120) as response:
+            data = response.read()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            return True
+    except (urllib.error.URLError, urllib.error.HTTPError):
+        return False
 
 
 def clean_attachment_name(name: str) -> str:
@@ -267,32 +287,49 @@ def canonical_filename(issue_seed: str, row_idx: int, topic: str, row_id: str, s
     return f"{topic_slug}_{row_slug}_{digest}_raw{ext}"
 
 
-def ensure_dataframe(database_path: pathlib.Path) -> pd.DataFrame:
-    if database_path.exists():
-        df = pd.read_csv(database_path)
-    else:
-        columns = REQUIRED_FIELDS + ["Filename", "ProcessedAt", "Peak_kW", "Area_kJ", "UID", "Concise ID", SUBMISSION_COL]
-        df = pd.DataFrame(columns=columns)
-    for column in REQUIRED_FIELDS + ["Filename", "ProcessedAt", "UID", "Concise ID", SUBMISSION_COL]:
-        if column not in df.columns:
-            df[column] = pd.Series(dtype="string")
-    for column in ["Peak_kW", "Area_kJ"]:
-        if column not in df.columns:
-            df[column] = pd.Series(dtype="float64")
-    return df
+DATABASE_COLUMNS = REQUIRED_FIELDS + [
+    "Filename",
+    "ProcessedAt",
+    "Peak_kW",
+    "Area_kJ",
+    "UID",
+    "Concise ID",
+    SUBMISSION_COL,
+]
 
 
-def upsert_rows(df: pd.DataFrame, rows: Sequence[Dict[str, str]], submission_prefix: str) -> Tuple[pd.DataFrame, int, int]:
-    if SUBMISSION_COL not in df.columns:
-        df[SUBMISSION_COL] = pd.Series(dtype="string")
+def ensure_row_defaults(row: Dict[str, str]) -> Dict[str, str]:
+    for column in DATABASE_COLUMNS:
+        row.setdefault(column, "")
+    return row
+
+
+def read_database(database_path: pathlib.Path) -> List[Dict[str, str]]:
+    if not database_path.exists():
+        return []
+    with database_path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = [ensure_row_defaults(dict(row)) for row in reader]
+    return rows
+
+
+def write_database(database_path: pathlib.Path, rows: Sequence[Dict[str, str]]) -> None:
+    database_path.parent.mkdir(parents=True, exist_ok=True)
+    with database_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=DATABASE_COLUMNS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column, "") for column in DATABASE_COLUMNS})
+
+
+def upsert_rows(existing_rows: List[Dict[str, str]], rows: Sequence[Dict[str, str]], submission_prefix: str) -> Tuple[List[Dict[str, str]], int, int]:
     existing_keys = {
-        str(val).strip()
-        for val in df[SUBMISSION_COL].astype(str).tolist()
-        if str(val).strip() and str(val).strip().lower() != "nan"
+        (row.get(SUBMISSION_COL, "") or "").strip()
+        for row in existing_rows
+        if (row.get(SUBMISSION_COL, "") or "").strip()
     }
-
-    to_add: List[Dict[str, str]] = []
     updated = 0
+    added = 0
     normalized_rows: List[Dict[str, str]] = []
     for idx, row in enumerate(rows, start=1):
         normalized: Dict[str, str] = {field: row.get(field, "") for field in REQUIRED_FIELDS + ["Filename"]}
@@ -300,21 +337,21 @@ def upsert_rows(df: pd.DataFrame, rows: Sequence[Dict[str, str]], submission_pre
         normalized_rows.append(normalized)
 
     for normalized in normalized_rows:
-        key = normalized.get(SUBMISSION_COL, "").strip()
+        key = (normalized.get(SUBMISSION_COL, "") or "").strip()
         if key and key in existing_keys:
-            mask = df[SUBMISSION_COL] == key
-            for field, value in normalized.items():
-                if field in df.columns:
-                    df.loc[mask, field] = value
-            updated += int(mask.sum())
+            for existing in existing_rows:
+                if (existing.get(SUBMISSION_COL, "") or "").strip() == key:
+                    existing.update(normalized)
+                    ensure_row_defaults(existing)
+                    updated += 1
+                    break
         else:
-            to_add.append(normalized)
+            new_row = ensure_row_defaults(dict(normalized))
+            existing_rows.append(new_row)
             if key:
                 existing_keys.add(key)
-
-    if to_add:
-        df = pd.concat([df, pd.DataFrame(to_add)], ignore_index=True)
-    return df, len(to_add), updated
+            added += 1
+    return existing_rows, added, updated
 
 
 def ensure_raw_file(row: Dict[str, str], idx: int, issue_seed: str, attachments: List[Attachment],
@@ -407,10 +444,10 @@ def ingest_issue(body: str, issue_number: str, run_id: str, token: str, database
         normalized["Filename"] = filename
         prepared_rows.append(normalized)
 
-    df = ensure_dataframe(database_path)
+    existing_rows = read_database(database_path)
     submission_prefix = f"issue-{issue_number}" if issue_number else (f"run-{run_id}" if run_id else "manual")
-    df, added, updated = upsert_rows(df, prepared_rows, submission_prefix)
-    df.to_csv(database_path, index=False)
+    updated_rows, added, updated = upsert_rows(existing_rows, prepared_rows, submission_prefix)
+    write_database(database_path, updated_rows)
     return added, updated
 
 
