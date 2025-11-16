@@ -1,9 +1,1 @@
 ID,Scource in IDEEE,Time Unit,Energy Unit,Topic,Filename,ProcessedAt,Peak_kW,Area_kJ,UID,Concise ID,SubmissionKey
-1,Siemens Switzerland AG; DBI,s,kW,car,CAR_2010_Test01_raw.csv,2025-11-13T20:59:24+00:00,8622.511405330553,125224.18998305133,90f333,1_Siemens_90f333_v03,
-2,Siemens Switzerland AG; DBI,s,kW,car,CAR_2010_Test02__raw.csv,2025-11-13T16:10:04+00:00,7451.647714446969,133463.0806162156,d44334,2_Siemens_d44334_v02,
-1,Siemens Switzerland AG; DBI,s,kW,car,CAR_2010_Test03.csv,2025-11-13T15:53:25+00:00,8296.648552866425,165592.971338523,90f333,1_Siemens_90f333,
-2,Siemens Switzerland AG; DBI,s,kW,car,CAR_2010_Test04.csv,2025-11-13T15:53:25+00:00,6416.966792318991,119979.9456014969,d44334,2_Siemens_d44334,
-1,Siemens Switzerland AG; DBI,s,kW,car,CAR_2010_Test01_raw.csv,,,,,,issue-2-row-1
-2,Siemens Switzerland AG; DBI,s,kW,car,CAR_2010_Test02__raw.csv,,,,,,issue-2-row-2
-1,10.1016/j.firesaf.2025.104558,s,kW,car,CAR_2010_Test01_raw.csv,,,,,,issue-14-row-1
-2,"[1]Y. Zhang and J. Ye, âSimulation Study on Tunnel Temperature Field Evolution Considering Vehicle-to-Vehicle Fire Spread in Real Traffic Scenarios,â Fire Technology, Mar. 2025, doi: 10.1007/s10694-025-01725-x.",s,kW,car,CAR_2010_Test02_raw.csv,2025-11-13T20:59:24+00:00,8271.962520671645,156218.43503428664,0fe2a5,2_10_1007_0fe2a5,issue-14-row-2
