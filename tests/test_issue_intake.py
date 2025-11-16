@@ -63,3 +63,50 @@ def test_ingest_issue_accepts_csv_links_with_query(tmp_path, monkeypatch):
         filename = row["Filename"]
         assert filename
         assert (raw_dir / filename).is_file()
+
+
+def test_ingest_issue_skips_instruction_code_block(tmp_path):
+    issue_body = """**Instructions**
+1) Attach files
+
+```
+ID: <per-issue number>
+Scource in IDEEE: <who provided the data>
+Topic: <topic name>
+Time Unit: <e.g., s>
+Energy Unit: <e.g., kW>
+Attachment filename: <uploaded filename>
+```
+
+### File details for database.csv
+
+ID: 1
+Scource in IDEEE: Example Source
+Topic: car
+Time Unit: s
+Energy Unit: kW
+Attachment filename: car_test.csv
+
+```csv filename=car_test.csv
+time,hrr
+0,0
+```
+"""
+
+    database = tmp_path / "database.csv"
+    raw_dir = tmp_path / "raw"
+
+    added, updated = issue_intake.ingest_issue(
+        issue_body,
+        issue_number="77",
+        run_id="123",
+        token="",
+        database_path=database,
+        raw_dir=raw_dir,
+    )
+
+    assert added == 1
+    assert updated == 0
+    with database.open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["ID"] == "1"
