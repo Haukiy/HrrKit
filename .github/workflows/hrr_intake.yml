@@ -589,7 +589,7 @@ jobs:
           Path('validation_summary.md').write_text(summary, encoding='utf-8')
           with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
               fh.write(f"status={status}\n")
-              fh.write("summary<<'EOF'\n")
+              fh.write("summary<<EOF\n")
               fh.write(summary)
               fh.write("EOF\n")
           PY
