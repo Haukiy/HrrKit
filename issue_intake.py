@@ -91,7 +91,16 @@ def find_csv_block(text: str) -> str:
 
 
 def normalize_key(name: str) -> str:
-    return re.sub(r"\s+", " ", (name or "").strip().lower())
+    """Return a canonical representation for template field names."""
+
+    cleaned = (name or "").strip().lower()
+    # Issue forms often wrap field names in Markdown emphasis (e.g. "**ID**")
+    # or prefix them with bullets. Strip those wrapper characters while
+    # keeping meaningful punctuation such as parentheses.
+    cleaned = re.sub(r"^[\s>\-*_`•]+", "", cleaned)
+    cleaned = re.sub(r"[\s>\-*_`•]+$", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
 
 
 def parse_structured_blocks(text: str) -> List[Dict[str, str]]:
@@ -124,7 +133,7 @@ def parse_structured_blocks(text: str) -> List[Dict[str, str]]:
         if not stripped:
             flush_current()
             continue
-        if stripped.startswith("###") or stripped.startswith("**"):
+        if stripped.startswith("###"):
             continue
         if ":" not in stripped:
             continue
