@@ -4,8 +4,13 @@ on:
   issues:
     types: [labeled]           # run only when a label is added
   issue_comment:
-    types: [created]           # allow /process or /intake-commit re-runs
+    types: [created]           # allow /validate or /intake-commit re-runs
   workflow_dispatch:           # manual run from Actions UI
+    inputs:
+      mode:
+        description: "Run mode: validation or process"
+        required: false
+        default: validation
 
 permissions:
   contents: write
@@ -23,6 +28,7 @@ jobs:
        contains(join(github.event.issue.labels.*.name, ','), 'hrr-intake')) ||
       (github.event_name == 'issue_comment' && (
          startsWith(github.event.comment.body, '/process') ||
+         startsWith(github.event.comment.body, '/validate') ||
          startsWith(github.event.comment.body, '/intake-commit')
       )) ||
       (github.event_name == 'workflow_dispatch')
@@ -63,15 +69,50 @@ jobs:
             core.setOutput('body', issue.body ?? '');
             core.setOutput('labels', (issue.labels ?? []).map(l => l.name).join(','));
 
-      - name: Detect commit trigger from comment
-        id: trig
+      - name: Determine run mode
+        id: mode
         uses: actions/github-script@v7
         with:
           script: |
-            const isComment = context.eventName === 'issue_comment';
-            const body = isComment ? (context.payload.comment?.body || '') : '';
-            const commitFromComment = isComment && body.trim().startsWith('/intake-commit');
-            core.setOutput('commit_from_comment', commitFromComment ? 'true' : 'false');
+            const event = context.eventName;
+            let mode = 'validation';
+            if (event === 'issue_comment') {
+              const body = (context.payload.comment?.body || '').trim();
+              if (body.startsWith('/intake-commit')) {
+                mode = 'process';
+              } else {
+                mode = 'validation';
+              }
+            } else if (event === 'workflow_dispatch') {
+              const inputMode = (core.getInput('mode') || 'validation').trim().toLowerCase();
+              if (inputMode === 'process') {
+                mode = 'process';
+              }
+            }
+            core.setOutput('mode', mode);
+
+      - name: Require successful validation label before processing
+        if: ${{ steps.mode.outputs.mode == 'process' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = Number('${{ steps.payload.outputs.number }}');
+            const labelName = 'hrr-validated';
+            const { data: issue } = await github.rest.issues.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+            });
+            const hasLabel = (issue.labels || []).some(label => label.name === labelName);
+            if (!hasLabel) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: '⚠️ Validation has not passed yet. Comment **`/validate`** to run Phase 1 before requesting `/intake-commit`. '
+              });
+              core.setFailed(`Issue #${issueNumber} is missing the '${labelName}' label.`);
+            }
 
       - name: Prepare raw_files, parse CSV from issue, pull files (attachments or inline), update database.csv
         env:
@@ -83,7 +124,7 @@ jobs:
           mkdir -p raw_files
 
           python - << 'PY'
-          import os, re, sys, csv, io, pathlib, requests
+          import os, re, sys, csv, io, pathlib, requests, hashlib
           import pandas as pd
 
           body = os.environ.get("ISSUE_BODY","")
@@ -100,16 +141,24 @@ jobs:
                   return m.group(1).strip()
               # Fallback: locate header anywhere, then collect CSV-looking lines
               lines = text.splitlines()
-              canonical = "id,scource in ideee,time unit,energy unit,topic,filename"
-              canonical_nospace = re.sub(r"\s+", "", canonical)
+              canonical_headers = [
+                  "id,scource in ideee,time unit,energy unit,topic",
+                  "id,scource in ideee,time unit,energy unit,topic,attachment filename",
+                  "id,scource in ideee,time unit,energy unit,topic,filename",
+              ]
+              canonical_nospace = [re.sub(r"\s+", "", header) for header in canonical_headers]
               start = None
               for i, line in enumerate(lines):
                   raw = line.strip().lower()
-                  if not raw: continue
+                  if not raw:
+                      continue
                   norm = re.sub(r"\s*,\s*", ",", raw)
-                  if norm == canonical or re.sub(r"\s+", "", raw) == canonical_nospace:
-                      start = i; break
-              if start is None: return ""
+                  nospace = re.sub(r"\s+", "", raw)
+                  if norm in canonical_headers or nospace in canonical_nospace:
+                      start = i
+                      break
+              if start is None:
+                  return ""
               out = [re.sub(r"\s*,\s*", ",", lines[start].strip())]
               for j in range(start+1, len(lines)):
                   s = lines[j]
@@ -141,7 +190,7 @@ jobs:
                   "attachment file name": "__attachment_hint__",
               }
 
-              required = ["ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename"]
+              required = ["ID","Scource in IDEEE","Time Unit","Energy Unit","Topic"]
               rows = []
               current = {}
 
@@ -235,11 +284,31 @@ jobs:
           rows = []
           if csv_block:
               csv_block = re.sub(r",\s+", ",", csv_block)
-              rows = list(csv.DictReader(io.StringIO(csv_block)))
-              if not rows:
+              raw_rows = list(csv.DictReader(io.StringIO(csv_block)))
+              if not raw_rows:
                   print("CSV block parsed but contains no rows.", file=sys.stderr); sys.exit(1)
-              for r in rows:
-                  r["__attachment_hint__"] = ""
+              csv_key_map = {
+                  "id": "ID",
+                  "scource in ideee": "Scource in IDEEE",
+                  "source in ideee": "Scource in IDEEE",
+                  "topic": "Topic",
+                  "time unit": "Time Unit",
+                  "energy unit": "Energy Unit",
+                  "filename": "Filename",
+                  "filename (save as)": "Filename",
+                  "attachment filename": "__attachment_hint__",
+                  "attachment file name": "__attachment_hint__",
+              }
+              rows = []
+              for raw in raw_rows:
+                  normalized = {"__attachment_hint__": ""}
+                  for key, value in raw.items():
+                      if key is None:
+                          continue
+                      canonical = csv_key_map.get(key.strip().lower())
+                      target_key = canonical or key.strip()
+                      normalized[target_key] = (value or "").strip()
+                  rows.append(normalized)
           else:
               rows = parse_structured_blocks(body)
               if not rows:
@@ -247,7 +316,7 @@ jobs:
                   print("Body preview:", body[:300].replace("\n","\\n"), file=sys.stderr)
                   sys.exit(1)
 
-          required = ["ID","Scource in IDEEE","Time Unit","Energy Unit","Topic","Filename"]
+          required = ["ID","Scource in IDEEE","Time Unit","Energy Unit","Topic"]
           missing = [h for h in required if h not in rows[0].keys()]
           if missing:
               print("CSV header mismatch. Need exactly:", ", ".join(required), file=sys.stderr)
@@ -290,12 +359,43 @@ jobs:
               return False
 
           inline_files = extract_inline_files(body)  # {"filename.csv": "content\n", ...}
+          inline_used = {name: False for name in inline_files.keys()}
 
           def clean_attachment_name(name: str) -> str:
               name = (name or "").strip()
               name = re.sub(r"\s*\(.*?\)\s*$", "", name)
               name = name.strip()
               return pathlib.Path(name).name if name else ""
+
+          def _take_next_unused_inline():
+              for nm, used in inline_used.items():
+                  if not used:
+                      inline_used[nm] = True
+                      return nm
+              return None
+
+          def slugify_for_filename(value: str, fallback: str) -> str:
+              cleaned = re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+              return cleaned or fallback
+
+          def canonical_filename(issue_seed: str, row_idx: int, topic: str, row_id: str,
+                                  source_name: str, time_unit: str, energy_unit: str) -> str:
+              topic_slug = slugify_for_filename(topic, "topic")[:40]
+              row_slug = slugify_for_filename(row_id, f"row{row_idx}")[:40]
+              ext = pathlib.Path(source_name or "").suffix.lower()
+              if ext not in (".csv", ".txt"):
+                  ext = ".csv"
+              seed = "|".join([
+                  issue_seed or "manual",
+                  str(row_idx),
+                  topic_slug,
+                  row_slug,
+                  (time_unit or "").strip().lower(),
+                  (energy_unit or "").strip().lower(),
+                  (source_name or "").strip().lower(),
+              ])
+              digest = hashlib.sha256(seed.encode("utf-8", "ignore")).hexdigest()[:10]
+              return f"{topic_slug}_{row_slug}_{digest}_raw{ext}"
 
           # ---------- Ensure database.csv ----------
           csv_path = pathlib.Path("database.csv")
@@ -309,49 +409,70 @@ jobs:
 
           raw_dir = pathlib.Path("raw_files"); raw_dir.mkdir(parents=True, exist_ok=True)
 
+          issue_seed = issue_number or run_id or "manual"
+
           # ---------- For each row, ensure the raw file exists (download or inline) ----------
-          for r in rows:
+          for idx, r in enumerate(rows, start=1):
               for k in required:
                   if not str(r.get(k, "")).strip():
                       print(f"Missing field in CSV row: {k}", file=sys.stderr); sys.exit(1)
 
-              desired = r["Filename"].strip()
-              base = pathlib.Path(desired).name
-              dest = raw_dir / desired
               attachment_hint = clean_attachment_name(r.get("__attachment_hint__", ""))
+              chosen_inline_name = None
+              chosen_attachment = None
 
-              have = False
-              att = _find_attachment_by_name(base)
-              if att:
-                  print(f"Attempting download '{att['name']}' -> {dest}")
-                  have = _download_attachment(att, dest)
-
-              if not have and attachment_hint:
-                  hint_base = pathlib.Path(attachment_hint).name
-                  att = _find_attachment_by_name(hint_base)
+              if attachment_hint and attachment_hint in inline_files and not inline_used.get(attachment_hint):
+                  inline_used[attachment_hint] = True
+                  chosen_inline_name = attachment_hint
+              elif attachment_hint:
+                  att = _find_attachment_by_name(attachment_hint)
                   if att:
-                      print(f"Attempting download via attachment hint '{hint_base}' -> {dest}")
-                      have = _download_attachment(att, dest)
+                      chosen_attachment = att
 
-              if not have and base in inline_files:
-                  print(f"Writing inline file -> {dest}")
-                  dest.parent.mkdir(parents=True, exist_ok=True)
-                  with open(dest, "w", newline="") as f:
-                      f.write(inline_files[base])
-                  have = True
-
-              if not have:
+              if not chosen_inline_name and not chosen_attachment:
                   att = _take_next_unused_attachment()
                   if att:
-                      print(f"No attachment name match for row ID {r['ID']} - using '{att['name']}' by submission order -> {dest}")
-                      have = _download_attachment(att, dest)
+                      chosen_attachment = att
+
+              if not chosen_inline_name and not chosen_attachment:
+                  fallback_inline = _take_next_unused_inline()
+                  if fallback_inline:
+                      chosen_inline_name = fallback_inline
+
+              if not chosen_inline_name and not chosen_attachment:
+                  print(f"Could not match any attachment for row ID {r['ID']}.", file=sys.stderr)
+                  sys.exit(1)
+
+              source_name = chosen_inline_name or (chosen_attachment["name"] if chosen_attachment else attachment_hint)
+              canonical_name = canonical_filename(
+                  issue_seed,
+                  idx,
+                  r.get("Topic", ""),
+                  r.get("ID", f"row{idx}"),
+                  source_name or f"row{idx}.csv",
+                  r.get("Time Unit", ""),
+                  r.get("Energy Unit", ""),
+              )
+              dest = raw_dir / canonical_name
+
+              have = False
+              if chosen_inline_name:
+                  print(f"Writing inline file '{chosen_inline_name}' -> {dest}")
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  with open(dest, "w", newline="") as f:
+                      f.write(inline_files[chosen_inline_name])
+                  have = True
+              elif chosen_attachment:
+                  print(f"Attempting download '{chosen_attachment['name']}' -> {dest}")
+                  have = _download_attachment(chosen_attachment, dest)
 
               r.pop("__attachment_hint__", None)
+              r["Filename"] = canonical_name
 
               if not have:
-                  print(f"Could not obtain '{desired}'.", file=sys.stderr)
+                  print(f"Could not obtain '{canonical_name}'.", file=sys.stderr)
                   print("Either attach the CSV or embed it as a code block like:", file=sys.stderr)
-                  print("```csv filename=" + base + "\\n<your csv content>\\n```", file=sys.stderr)
+                  print("```csv filename=" + (source_name or canonical_name) + "\\n<your csv content>\\n```", file=sys.stderr)
                   sys.exit(1)
 
           # ---------- Append/update DB rows ----------
@@ -407,7 +528,127 @@ jobs:
           df.to_csv(csv_path, index=False)
           PY
 
+      - name: Run HRR validation
+        if: ${{ steps.mode.outputs.mode == 'validation' }}
+        id: validation_run
+        continue-on-error: true
+        run: |
+          python - << 'PY'
+          import os, subprocess, sys
+          import matplotlib; matplotlib.use("Agg")
+          script = (
+            'hrr_chat.py' if os.path.exists('hrr_chat.py')
+            else ('hrrkit_excel.py' if os.path.exists('hrrkit_excel.py') else None)
+          )
+          if not script:
+            print("Error: neither hrr_chat.py nor hrrkit_excel.py found", file=sys.stderr)
+            sys.exit(1)
+          sys.exit(subprocess.call([sys.executable, script,
+            "--database","database.csv","--raw","raw_files","--base","hrr_database",
+            "--quantile","0.90","--validate-only","--validation-report","validation_report.json"]))
+          PY
+
+      - name: Summarize validation results
+        if: ${{ steps.mode.outputs.mode == 'validation' }}
+        id: validation_summary
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          report_path = Path('validation_report.json')
+          lines = ['### HRR validation report']
+          status = 'error'
+          if not report_path.exists():
+              lines.append('')
+              lines.append('_Validator did not produce a report._')
+          else:
+              data = json.loads(report_path.read_text())
+              status = data.get('overall_status', 'error')
+              rows = data.get('rows') or []
+              lines.append('')
+              lines.append(f"*Overall status:* **{status.upper()}**")
+              if not rows:
+                  lines.append('')
+                  lines.append('No pending rows were found in database.csv.')
+              else:
+                  for row in rows:
+                      indicator = '✅' if row.get('status') == 'ok' else '❌'
+                      rid = str(row.get('id') or row.get('row_index'))
+                      topic = row.get('topic') or '(topic missing)'
+                      lines.append('')
+                      lines.append(f"{indicator} Row ID {rid} ({topic})")
+                      errors = row.get('errors') or []
+                      warnings = row.get('warnings') or []
+                      for err in errors:
+                          lines.append(f"    - {err}")
+                      for warn in warnings:
+                          lines.append(f"    - warning: {warn}")
+
+          summary = '\n'.join(lines).strip() + '\n'
+          Path('validation_summary.md').write_text(summary, encoding='utf-8')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as fh:
+              fh.write(f"status={status}\n")
+              fh.write("summary<<'EOF'\n")
+              fh.write(summary)
+              fh.write("EOF\n")
+          PY
+
+      - name: Update validation label
+        if: ${{ steps.mode.outputs.mode == 'validation' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = Number('${{ steps.payload.outputs.number }}');
+            const status = '${{ steps.validation_summary.outputs.status }}';
+            const labelName = 'hrr-validated';
+            if (status === 'success') {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                labels: [labelName],
+              });
+            } else {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  name: labelName,
+                });
+              } catch (error) {
+                // ignore if label absent
+              }
+            }
+
+      - name: Comment validation result
+        if: ${{ steps.mode.outputs.mode == 'validation' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const issueNumber = Number('${{ steps.payload.outputs.number }}');
+            const status = '${{ steps.validation_summary.outputs.status }}';
+            let summary = 'Validation summary unavailable.\n';
+            try {
+              summary = fs.readFileSync('validation_summary.md', 'utf-8');
+            } catch (error) {
+              // keep fallback summary
+            }
+            const nextStep = status === 'success'
+              ? '\n\n✅ Validation passed. Comment **`/intake-commit`** to run Phase 2 (processing + commit).'
+              : '\n\nPlease address the issues above, then comment **`/validate`** to rerun Phase 1.';
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: summary + nextStep,
+            });
+
       - name: Run HRR processor
+        if: ${{ steps.mode.outputs.mode == 'process' }}
+        id: process_run
         run: |
           python - << 'PY'
           import os, subprocess, sys
@@ -424,9 +665,11 @@ jobs:
           PY
 
       - name: Ensure output dir for artifact
+        if: ${{ steps.mode.outputs.mode == 'process' }}
         run: mkdir -p hrr_database
 
       - name: Upload outputs (artifact)
+        if: ${{ steps.mode.outputs.mode == 'process' }}
         uses: actions/upload-artifact@v4
         with:
           name: hrr-outputs-issue-${{ steps.payload.outputs.number }}
@@ -436,8 +679,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 10
 
-      - name: Commit changes (only when comment is /intake-commit)
-        if: ${{ steps.trig.outputs.commit_from_comment == 'true' }}
+      - name: Commit changes (processing phase)
+        if: ${{ steps.mode.outputs.mode == 'process' }}
         shell: bash
         run: |
           set -e
@@ -453,26 +696,48 @@ jobs:
             echo "No changes to commit."
           fi
 
-      - name: Comment result on issue
+      - name: Clear validation label after processing
+        if: ${{ always() && steps.mode.outputs.mode == 'process' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = Number('${{ steps.payload.outputs.number }}');
+            const labelName = 'hrr-validated';
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                name: labelName,
+              });
+            } catch (error) {
+              // ignore
+            }
+
+      - name: Comment processing result
+        if: ${{ always() && steps.mode.outputs.mode == 'process' }}
         uses: actions/github-script@v7
         with:
           script: |
             const num = Number('${{ steps.payload.outputs.number }}');
             const artifactName = `hrr-outputs-issue-${num}`;
-            const commitTriggered = '${{ steps.trig.outputs.commit_from_comment }}' === 'true';
-            const lines = [
-              '✅ HRR intake check completed.',
-              '',
-              `- Results attached as workflow artifact: **${artifactName}**`,
-              commitTriggered
-                ? '- Outputs were committed to the repository.'
-                : '- To commit these results to the repository, comment: **`/intake-commit`**',
-              '',
-              'Re-run this check by commenting: **`/process`**'
-            ];
+            const succeeded = '${{ steps.process_run.outcome }}' === 'success';
+            const lines = [];
+            if (succeeded) {
+              lines.push('✅ HRR processing (Phase 2) completed.');
+              lines.push('');
+              lines.push(`- Artifact: **${artifactName}**`);
+              lines.push('- Results were committed to the repository.');
+              lines.push('');
+              lines.push('Need to ingest more data? Update the issue and rerun Phase 1 with **`/validate`**.');
+            } else {
+              lines.push('❌ HRR processing (Phase 2) failed.');
+              lines.push('');
+              lines.push('Check the workflow logs for details, address the problem, then rerun Phase 1 with **`/validate`**.');
+            }
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: num,
-              body: lines.join('\n')
+              body: lines.join('\n'),
             });

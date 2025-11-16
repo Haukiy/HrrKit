@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import re
 import shutil
 import textwrap
@@ -369,6 +370,18 @@ def ensure_topic_structure(base_dir: Path, topic_name: str) -> TopicPaths:
         shape_curves=shape_curves,
         plots=plots,
     )
+
+
+def ensure_all_topic_directories(base_dir: Path, topics: Iterable[str]) -> None:
+    seen: Set[str] = set()
+    for topic in topics:
+        topic_clean = str(topic).strip()
+        if not topic_clean or topic_clean.lower() in ("nan", "none"):
+            continue
+        if topic_clean in seen:
+            continue
+        ensure_topic_structure(base_dir, topic_clean)
+        seen.add(topic_clean)
 
 
 # --------------------------- CSV / units helpers ----------------------------
@@ -710,6 +723,56 @@ def save_sources_registry(paths: TopicPaths, registry_df: pd.DataFrame) -> None:
     registry_df.to_csv(sources_registry_path(paths), index=False)
 
 
+# ----------------------------- Row validation --------------------------------
+
+def validate_row_inputs(row: pd.Series, raw_dir: Path) -> Tuple[bool, List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    def _is_empty(value: str) -> bool:
+        return (value.strip() == "") or (value.strip().lower() in {"nan", "none"})
+
+    for field in ("ID", "Scource in IDEEE", "Time Unit", "Energy Unit", "Topic", "Filename"):
+        val = str(row.get(field, ""))
+        if _is_empty(val):
+            errors.append(f"Missing '{field}'")
+
+    if errors:
+        return False, errors, warnings
+
+    time_unit = str(row.get("Time Unit", ""))
+    energy_unit = str(row.get("Energy Unit", ""))
+    if not normalize_time_unit(time_unit):
+        errors.append(f"Unsupported time unit '{time_unit}'")
+    if not normalize_energy_unit(energy_unit):
+        errors.append(f"Unsupported energy unit '{energy_unit}'")
+
+    filename = str(row.get("Filename", ""))
+    raw_path = (raw_dir / filename).resolve()
+    if not raw_path.exists():
+        errors.append(f"Raw file not found: {raw_path}")
+        return False, errors, warnings
+
+    try:
+        df_raw = load_raw_curve(raw_path)
+    except Exception as ex:
+        errors.append(f"Failed to read CSV: {ex}")
+        return False, errors, warnings
+
+    if df_raw.shape[1] < 2:
+        errors.append("Raw CSV must contain at least two columns")
+        return False, errors, warnings
+
+    time_col = detect_column(df_raw.columns, TIME_COL_CANDIDATES) or df_raw.columns[0]
+    hrr_col = detect_column(df_raw.columns, HRR_COL_CANDIDATES) or df_raw.columns[1]
+    try:
+        normalise_curve_seconds_kw(df_raw, time_col, hrr_col, time_unit, energy_unit)
+    except Exception as ex:
+        errors.append(str(ex))
+
+    return len(errors) == 0, errors, warnings
+
+
 # ---------------------- Row processing (move + clean + shape) ----------------
 
 def process_row_to_files(
@@ -1032,6 +1095,9 @@ def main() -> None:
     parser.add_argument("--raw",   default=DEFAULT_RAW_DIR, help="Folder with raw CSV files (default: raw_files)")
     parser.add_argument("--base",  default=DEFAULT_BASE_DIR, help="Output base directory (default: hrr_database)")
     parser.add_argument("--quantile", type=float, default=AGG_QUANTILE, help="Quantile for aggregate curve (0..1)")
+    parser.add_argument("--validate-only", action="store_true",
+                        help="Run validations without moving files or updating per-topic data.")
+    parser.add_argument("--validation-report", default="", help="Optional path for JSON validation report")
     args = parser.parse_args()
 
     database_path = Path(args.database).resolve()
@@ -1042,9 +1108,6 @@ def main() -> None:
     ensure_directory(base_dir)
 
     db_df = read_database(database_path)
-    if db_df.empty:
-        print("No rows to process. Fill the template and rerun.")
-        return
 
     # Make sure string columns truly are string dtype (prevents FutureWarning on assignment)
     db_df = _ensure_string_columns(db_df, [
@@ -1052,23 +1115,69 @@ def main() -> None:
         "ProcessedAt", "UID", "Concise ID"
     ])
 
+    pending_rows: List[Tuple[int, pd.Series]] = []
+    for idx, row in db_df.iterrows():
+        processed_at_val = str(row.get("ProcessedAt", "")).strip()
+        if processed_at_val and processed_at_val.lower() not in ("nan", "none"):
+            print(f"[row {idx}] Skipping already processed row (ProcessedAt={processed_at_val}).")
+            continue
+        pending_rows.append((idx, row))
+
+    if args.validate_only:
+        report_rows: List[Dict[str, Any]] = []
+        any_failures = False
+        for idx, row in pending_rows:
+            ok, errors, warnings = validate_row_inputs(row, raw_dir)
+            entry = {
+                "row_index": int(idx),
+                "id": str(row.get("ID", "")),
+                "topic": str(row.get("Topic", "")),
+                "filename": str(row.get("Filename", "")),
+                "status": "ok" if ok else "error",
+                "errors": errors,
+                "warnings": warnings,
+            }
+            if not ok:
+                any_failures = True
+            report_rows.append(entry)
+
+        if args.validation_report:
+            report_payload = {
+                "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "overall_status": ("noop" if not report_rows else ("failed" if any_failures else "success")),
+                "rows": report_rows,
+            }
+            Path(args.validation_report).write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+
+        if not pending_rows:
+            print("No new rows to validate.")
+            return
+
+        if any_failures:
+            print("Validation failed for one or more rows.")
+            raise SystemExit(2)
+
+        print(f"Validation successful for {len(report_rows)} row(s).")
+        return
+
+    if not pending_rows:
+        print("No rows to process. Fill the template and rerun.")
+        return
+
+    ensure_all_topic_directories(base_dir, (row.get("Topic", "") for _, row in pending_rows))
+
     processed_topics: Set[str] = set()
     registry_updates: Dict[str, List[Dict[str, Any]]] = {}
 
     now_str = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
-    for idx, row in db_df.iterrows():
-        processed_at_val = str(row.get("ProcessedAt", "")).strip()
-        if processed_at_val and processed_at_val.lower() not in ("nan", "none"):
-            print(f"[row {idx}] Skipping already processed row (ProcessedAt={processed_at_val}).")
-            # Already processed – leave as-is unless the user clears ProcessedAt
-            continue
-
+    for idx, row in pending_rows:
         mandatory_ok = all(
             str(row[col]).strip() not in ("", "nan", "None")
             for col in ("ID", "Scource in IDEEE", "Time Unit", "Energy Unit", "Topic", "Filename")
         )
         if not mandatory_ok:
+            print(f"[row {idx}] Missing required fields; skipping.")
             continue
 
         stats, error, topic, meta = process_row_to_files(row, raw_dir=raw_dir, base_dir=base_dir, now_str=now_str)

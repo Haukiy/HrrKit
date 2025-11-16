@@ -8,19 +8,19 @@ body:
       value: |
         **Instructions**
         1) Attach raw CSV file(s) by drag-and-drop below (GitHub will insert links).
-        2) For each attachment, fill out the following block (IDs can simply be 1, 2, 3... **for this issue only**—we handle the global IDs in the CSV):
+        2) For each attachment, fill out the following block (IDs can simply be 1, 2, 3... **for this issue only**—we handle the global IDs in the CSV). Filenames are generated automatically from your inputs + a hash.
 
            ```
            ID: <per-issue number>
            Scource in IDEEE: <who provided the data>
            Topic: <topic name>
-           Filename (save as): <desired filename in database.csv>
            Time Unit: <e.g., s>
            Energy Unit: <e.g., kW>
            Attachment filename: <the name GitHub inserts after you upload the file>
            ```
 
         3) Repeat the block for every file you are submitting and paste the combined text into the field below.
+        4) When ready, comment **`/validate`** on the issue to run Phase 1 (validation). Once it succeeds, comment **`/intake-commit`** to run Phase 2 (processing + commit).
 
   - type: textarea
     id: rows_csv
@@ -31,7 +31,6 @@ body:
         ID: 1
         Scource in IDEEE: Siemens Switzerland AG; DBI
         Topic: car
-        Filename (save as): CAR_2010_Test01_raw.csv
         Time Unit: s
         Energy Unit: kW
         Attachment filename: CAR_2010_Test01_raw.csv (uploaded below)
@@ -39,7 +38,6 @@ body:
         ID: 2
         Scource in IDEEE: Siemens Switzerland AG; DBI
         Topic: car
-        Filename (save as): CAR_2010_Test02_raw.csv
         Time Unit: s
         Energy Unit: kW
         Attachment filename: CAR_2010_Test02_raw.csv (uploaded below)
