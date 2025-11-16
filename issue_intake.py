@@ -423,7 +423,9 @@ def ingest_issue(body: str, issue_number: str, run_id: str, token: str, database
 
     raw_dir.mkdir(parents=True, exist_ok=True)
     attachments = []
-    attachment_pattern = re.compile(r"\((https?://[^\s)]+\.csv)\)", flags=re.I)
+    attachment_pattern = re.compile(
+        r"\((https?://[^\s)]+\.(?:csv|txt)(?:\?[^\s)]*)?)\)", flags=re.I
+    )
     for url in attachment_pattern.findall(body):
         clean_url = url.strip()
         name = pathlib.Path(clean_url.split("?")[0]).name
