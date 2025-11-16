@@ -1098,6 +1098,14 @@ def main() -> None:
     parser.add_argument("--validate-only", action="store_true",
                         help="Run validations without moving files or updating per-topic data.")
     parser.add_argument("--validation-report", default="", help="Optional path for JSON validation report")
+    parser.add_argument("--add-row", action="store_true",
+                        help="Append a new pending row to the database (no processing).")
+    parser.add_argument("--add-id", default="", help="Value for the 'ID' column when using --add-row")
+    parser.add_argument("--add-source", default="", help="Value for 'Scource in IDEEE' when using --add-row")
+    parser.add_argument("--add-time-unit", default="", help="Value for 'Time Unit' when using --add-row")
+    parser.add_argument("--add-energy-unit", default="", help="Value for 'Energy Unit' when using --add-row")
+    parser.add_argument("--add-topic", default="", help="Value for 'Topic' when using --add-row")
+    parser.add_argument("--add-filename", default="", help="Value for 'Filename' when using --add-row")
     args = parser.parse_args()
 
     database_path = Path(args.database).resolve()
@@ -1114,6 +1122,45 @@ def main() -> None:
         "ID", "Scource in IDEEE", "Time Unit", "Energy Unit", "Topic", "Filename",
         "ProcessedAt", "UID", "Concise ID"
     ])
+
+    if args.add_row:
+        add_fields = {
+            "ID": args.add_id,
+            "Scource in IDEEE": args.add_source,
+            "Time Unit": args.add_time_unit,
+            "Energy Unit": args.add_energy_unit,
+            "Topic": args.add_topic,
+            "Filename": args.add_filename,
+        }
+        missing = [name for name, value in add_fields.items() if not str(value).strip()]
+        if missing:
+            missing_str = ", ".join(missing)
+            raise SystemExit(f"--add-row requires values for: {missing_str}")
+
+        # Preserve any custom columns that may exist in the user's CSV
+        new_row = {col: pd.NA for col in db_df.columns}
+        for key, value in add_fields.items():
+            new_row[key] = pd.Series([value], dtype="string").iloc[0]
+        new_row["ProcessedAt"] = pd.NA
+        new_row["UID"] = pd.NA
+        new_row["Concise ID"] = pd.NA
+        new_row["Peak_kW"] = np.nan
+        new_row["Area_kJ"] = np.nan
+
+        db_df = pd.concat([db_df, pd.DataFrame([new_row])], ignore_index=True)
+        write_database(database_path, db_df)
+
+        pending_idx = len(db_df) - 1
+        raw_candidate = raw_dir / add_fields["Filename"]
+        if not raw_candidate.exists():
+            print(
+                f"Row {pending_idx} appended, but raw file '{raw_candidate}' does not exist yet.",
+                "Please place the file in the raw folder before processing.",
+                sep="\n    "
+            )
+        else:
+            print(f"Row {pending_idx} appended. Ready for validation/processing once metadata is verified.")
+        return
 
     pending_rows: List[Tuple[int, pd.Series]] = []
     for idx, row in db_df.iterrows():

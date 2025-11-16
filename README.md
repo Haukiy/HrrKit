@@ -11,3 +11,43 @@ replaces the `Scource in IDEEE` value with an IEEE-formatted reference. This
 updated value is stored in `database.csv`, the per-topic source registry, and the
 plot captions, so the user only has to provide the DOI/ISBN once.
 
+## Adding the first HRR entry
+
+When `database.csv` is empty it can be tedious to craft the first row manually.
+Use the CLI helper to append a pending entry directly from the terminal:
+
+```bash
+python hrrkit_excel.py \
+  --add-row \
+  --add-id "My test ID" \
+  --add-source "doi:10.1234/example" \
+  --add-time-unit sec \
+  --add-energy-unit kW \
+  --add-topic "Generic" \
+  --add-filename "example_curve.csv"
+```
+
+The command creates the CSV (if needed), adds a new row with blank `ProcessedAt`
+so that it shows up as "pending", and then you can run the regular validation or
+processing workflow.
+
+## Automatic intake from GitHub issues
+
+The CI workflow now calls [`issue_intake.py`](./issue_intake.py) before every
+validation/processing run. The helper reads the HRR intake issue body, downloads
+any referenced attachments (or inline fenced `csv` blocks that declare
+`filename=...`), and
+appends pending rows to `database.csv` with a stable `SubmissionKey`. Because of
+this, `/validate` works even when the repository starts with an empty database:
+as soon as the issue provides rows, they are imported automatically. You can run
+the same helper locally if you want to preview the import:
+
+```bash
+python issue_intake.py --body-file issue.md --database database.csv --raw-dir raw_files
+```
+
+The file `issue.md` should contain the Markdown body from the GitHub issue (you
+can copy/paste it from the UI). Inline CSV blocks are written to `raw_files/`
+and attachments are downloaded via their GitHub URLs, matching the behavior in
+CI.
+
