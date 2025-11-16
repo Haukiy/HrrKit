@@ -319,22 +319,45 @@ def ensure_row_defaults(row: Dict[str, str]) -> Dict[str, str]:
     return row
 
 
-def read_database(database_path: pathlib.Path) -> List[Dict[str, str]]:
+def merge_columns(existing_columns: Sequence[str], rows: Sequence[Dict[str, str]]) -> List[str]:
+    merged: List[str] = []
+    seen = set()
+
+    def add_column(name: str) -> None:
+        if not name or name in seen:
+            return
+        merged.append(name)
+        seen.add(name)
+
+    for column in existing_columns:
+        add_column(column)
+    for row in rows:
+        for key in row.keys():
+            add_column(key)
+    for column in DATABASE_COLUMNS:
+        add_column(column)
+    return merged
+
+
+def read_database(database_path: pathlib.Path) -> Tuple[List[Dict[str, str]], List[str]]:
     if not database_path.exists():
-        return []
+        return [], list(DATABASE_COLUMNS)
     with database_path.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         rows = [ensure_row_defaults(dict(row)) for row in reader]
-    return rows
+        columns = reader.fieldnames[:] if reader.fieldnames else []
+    return rows, columns
 
 
-def write_database(database_path: pathlib.Path, rows: Sequence[Dict[str, str]]) -> None:
+def write_database(database_path: pathlib.Path, rows: Sequence[Dict[str, str]],
+                   existing_columns: Sequence[str]) -> None:
     database_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = merge_columns(existing_columns, rows)
     with database_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=DATABASE_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            writer.writerow({column: row.get(column, "") for column in DATABASE_COLUMNS})
+            writer.writerow({column: row.get(column, "") for column in fieldnames})
 
 
 def upsert_rows(existing_rows: List[Dict[str, str]], rows: Sequence[Dict[str, str]], submission_prefix: str) -> Tuple[List[Dict[str, str]], int, int]:
@@ -461,10 +484,10 @@ def ingest_issue(body: str, issue_number: str, run_id: str, token: str, database
         normalized["Filename"] = filename
         prepared_rows.append(normalized)
 
-    existing_rows = read_database(database_path)
+    existing_rows, existing_columns = read_database(database_path)
     submission_prefix = f"issue-{issue_number}" if issue_number else (f"run-{run_id}" if run_id else "manual")
     updated_rows, added, updated = upsert_rows(existing_rows, prepared_rows, submission_prefix)
-    write_database(database_path, updated_rows)
+    write_database(database_path, updated_rows, existing_columns)
     return added, updated
 
 
