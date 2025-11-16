@@ -1058,7 +1058,8 @@ def main() -> None:
     now_str = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
     for idx, row in db_df.iterrows():
-        processed_at_val = str(row.get("ProcessedAt", "")).strip()
+        processed_at_raw = row.get("ProcessedAt", "")
+        processed_at_val = "" if pd.isna(processed_at_raw) else str(processed_at_raw).strip()
         if processed_at_val and processed_at_val.lower() not in ("nan", "none"):
             print(f"[row {idx}] Skipping already processed row (ProcessedAt={processed_at_val}).")
             # Already processed – leave as-is unless the user clears ProcessedAt
