@@ -255,7 +255,40 @@ jobs:
 
           # ---------- Attachments + Inline file map ----------
           urls = re.findall(r"\((https?://[^\s)]+\.csv)\)", body, flags=re.I)
-          url_map = {pathlib.Path(u.split("?")[0]).name: u for u in urls}
+          attachments = []
+          for u in urls:
+              clean_url = u.strip()
+              name = pathlib.Path(clean_url.split("?")[0]).name
+              attachments.append({
+                  "name": name,
+                  "name_lower": name.lower(),
+                  "url": clean_url,
+                  "used": False,
+              })
+
+          def _find_attachment_by_name(name: str):
+              if not name:
+                  return None
+              target = pathlib.Path(name).name.lower()
+              for att in attachments:
+                  if not att["used"] and att["name_lower"] == target:
+                      return att
+              return None
+
+          def _take_next_unused_attachment():
+              for att in attachments:
+                  if not att["used"]:
+                      return att
+              return None
+
+          def _download_attachment(att, dest: pathlib.Path) -> bool:
+              if not att:
+                  return False
+              if download_with_auth(att["url"], dest):
+                  att["used"] = True
+                  return True
+              return False
+
           inline_files = extract_inline_files(body)  # {"filename.csv": "content\n", ...}
 
           def clean_attachment_name(name: str) -> str:
@@ -288,15 +321,17 @@ jobs:
               attachment_hint = clean_attachment_name(r.get("__attachment_hint__", ""))
 
               have = False
-              if base in url_map:
-                  print(f"Attempting download -> {dest}")
-                  have = download_with_auth(url_map[base], dest)
+              att = _find_attachment_by_name(base)
+              if att:
+                  print(f"Attempting download '{att['name']}' -> {dest}")
+                  have = _download_attachment(att, dest)
 
               if not have and attachment_hint:
                   hint_base = pathlib.Path(attachment_hint).name
-                  if hint_base in url_map:
+                  att = _find_attachment_by_name(hint_base)
+                  if att:
                       print(f"Attempting download via attachment hint '{hint_base}' -> {dest}")
-                      have = download_with_auth(url_map[hint_base], dest)
+                      have = _download_attachment(att, dest)
 
               if not have and base in inline_files:
                   print(f"Writing inline file -> {dest}")
@@ -304,6 +339,12 @@ jobs:
                   with open(dest, "w", newline="") as f:
                       f.write(inline_files[base])
                   have = True
+
+              if not have:
+                  att = _take_next_unused_attachment()
+                  if att:
+                      print(f"No attachment name match for row ID {r['ID']} - using '{att['name']}' by submission order -> {dest}")
+                      have = _download_attachment(att, dest)
 
               r.pop("__attachment_hint__", None)
 

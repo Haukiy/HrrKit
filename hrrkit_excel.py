@@ -1058,6 +1058,12 @@ def main() -> None:
     now_str = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
     for idx, row in db_df.iterrows():
+        processed_at_val = str(row.get("ProcessedAt", "")).strip()
+        if processed_at_val and processed_at_val.lower() not in ("nan", "none"):
+            print(f"[row {idx}] Skipping already processed row (ProcessedAt={processed_at_val}).")
+            # Already processed – leave as-is unless the user clears ProcessedAt
+            continue
+
         mandatory_ok = all(
             str(row[col]).strip() not in ("", "nan", "None")
             for col in ("ID", "Scource in IDEEE", "Time Unit", "Energy Unit", "Topic", "Filename")
