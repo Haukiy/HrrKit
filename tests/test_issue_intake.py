@@ -2,6 +2,8 @@ import csv
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -120,3 +122,20 @@ Row1,Source,s,kW,car,file.csv
 
     block = issue_intake.find_csv_block(body)
     assert "Row1,Source" in block
+
+
+def test_ingest_issue_does_not_treat_metadata_block_as_raw(tmp_path):
+    body = """```csv filename=intake.csv
+ID,Scource in IDEEE,Time Unit,Energy Unit,Topic
+Row1,Source,s,kW,car
+```"""
+
+    with pytest.raises(issue_intake.IntakeError, match="Could not match any attachment"):
+        issue_intake.ingest_issue(
+            body,
+            issue_number="99",
+            run_id="123",
+            token="",
+            database_path=tmp_path / "database.csv",
+            raw_dir=tmp_path / "raw",
+        )
