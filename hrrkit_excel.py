@@ -41,6 +41,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
 import shutil
 import textwrap
@@ -452,6 +453,63 @@ def read_database(csv_path: Path) -> pd.DataFrame:
     ordered = [c for c in REQUIRED_COLUMNS + OPTIONAL_ADDED_COLUMNS if c in db_df.columns]
     ordered += [c for c in db_df.columns if c not in ordered]
     db_df = db_df[ordered]
+    return db_df
+
+
+def _collect_pending_rows(db_df: pd.DataFrame) -> List[Tuple[int, pd.Series]]:
+    pending_rows: List[Tuple[int, pd.Series]] = []
+    for idx, row in db_df.iterrows():
+        processed_at_val = str(row.get("ProcessedAt", "")).strip()
+        if processed_at_val and processed_at_val.lower() not in ("nan", "none"):
+            print(f"[row {idx}] Skipping already processed row (ProcessedAt={processed_at_val}).")
+            continue
+        pending_rows.append((idx, row))
+    return pending_rows
+
+
+def _load_issue_body(args: argparse.Namespace) -> str:
+    if args.issue_body_text:
+        return args.issue_body_text
+    if args.issue_body_file:
+        return Path(args.issue_body_file).read_text(encoding="utf-8")
+    return os.environ.get("ISSUE_BODY", "")
+
+
+def _maybe_import_issue_body(
+    args: argparse.Namespace, database_path: Path, raw_dir: Path, db_df: pd.DataFrame
+) -> pd.DataFrame:
+    body = _load_issue_body(args)
+    if not body.strip():
+        return db_df
+
+    try:
+        import issue_intake
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        print(f"Issue body provided but could not import issue_intake: {exc}")
+        return db_df
+
+    try:
+        added, updated = issue_intake.ingest_issue(
+            body,
+            args.issue_number.strip(),
+            args.run_id.strip(),
+            args.token.strip(),
+            database_path,
+            raw_dir,
+        )
+    except issue_intake.IntakeError as exc:  # pragma: no cover - parsing depends on issue content
+        print(f"Issue body detected but could not import rows: {exc}")
+        return db_df
+    except Exception as exc:  # pragma: no cover - defensive catch for workflow logs
+        print(f"Unexpected issue intake failure: {exc}")
+        return db_df
+
+    if added or updated:
+        print(f"Imported {added} new row(s) and refreshed {updated} row(s) from the issue body. Re-evaluating pending items...")
+        refreshed = read_database(database_path)
+        return _ensure_string_columns(refreshed, REQUIRED_COLUMNS + OPTIONAL_ADDED_COLUMNS)
+
+    print("Issue body parsed but produced no new rows (possible duplicates).")
     return db_df
 
 
@@ -1106,6 +1164,11 @@ def main() -> None:
     parser.add_argument("--add-energy-unit", default="", help="Value for 'Energy Unit' when using --add-row")
     parser.add_argument("--add-topic", default="", help="Value for 'Topic' when using --add-row")
     parser.add_argument("--add-filename", default="", help="Value for 'Filename' when using --add-row")
+    parser.add_argument("--issue-body-file", default="", help="Path to the intake issue body (Markdown)")
+    parser.add_argument("--issue-body-text", default="", help="Raw intake issue body text")
+    parser.add_argument("--issue-number", default=os.environ.get("ISSUE_NUMBER", ""), help="GitHub issue number for submission keys")
+    parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", ""), help="GitHub Actions run ID for submission keys")
+    parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN", ""), help="GitHub token for attachment downloads")
     args = parser.parse_args()
 
     database_path = Path(args.database).resolve()
@@ -1162,13 +1225,10 @@ def main() -> None:
             print(f"Row {pending_idx} appended. Ready for validation/processing once metadata is verified.")
         return
 
-    pending_rows: List[Tuple[int, pd.Series]] = []
-    for idx, row in db_df.iterrows():
-        processed_at_val = str(row.get("ProcessedAt", "")).strip()
-        if processed_at_val and processed_at_val.lower() not in ("nan", "none"):
-            print(f"[row {idx}] Skipping already processed row (ProcessedAt={processed_at_val}).")
-            continue
-        pending_rows.append((idx, row))
+    pending_rows = _collect_pending_rows(db_df)
+    if not pending_rows:
+        db_df = _maybe_import_issue_body(args, database_path, raw_dir, db_df)
+        pending_rows = _collect_pending_rows(db_df)
 
     if args.validate_only:
         report_rows: List[Dict[str, Any]] = []
