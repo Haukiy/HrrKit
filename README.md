@@ -51,3 +51,17 @@ can copy/paste it from the UI). Inline CSV blocks are written to `raw_files/`
 and attachments are downloaded via their GitHub URLs, matching the behavior in
 CI.
 
+If `/validate` reports **NOOP** or "no intake items found", the issue body
+was parsed without detecting any intake rows. Make sure the issue contains
+either a CSV table with the header `ID,Scource in IDEEE,Topic,Time Unit,Energy
+Unit,Filename` or the structured blocks from the intake template (the
+"ID/Topic/Time Unit/…" prompts). The **data files themselves do not need these
+metadata headers**—they can remain as simple time/HRR two-column CSVs—but the
+issue must still declare one intake block per file so the workflow knows how to
+seed `database.csv`. Once at least one block is present the intake helper will
+append pending rows to `database.csv`, allowing `/validate` to run
+automatically. The `hrrkit_excel.py --validate-only` CLI now follows the same
+pattern: if no pending rows are found it will try to import blocks from the
+issue body provided via `--issue-body-text`, `--issue-body-file`, or the
+`ISSUE_BODY` environment variable before declaring a NOOP.
+
