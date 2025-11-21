@@ -227,7 +227,21 @@ def parse_rows(body: str) -> List[Dict[str, str]]:
                 target_key = canonical or key.strip()
                 normalized[target_key] = (value or "").strip()
             rows.append(normalized)
-        return rows
+
+        normalized_headers = {
+            csv_key_map.get((header or "").strip().lower(), (header or "").strip())
+            for header in (reader[0].keys() if reader else [])
+        }
+        missing = [field for field in REQUIRED_FIELDS if field not in normalized_headers]
+        if not missing:
+            return rows
+
+        structured_rows = parse_structured_blocks(body)
+        if structured_rows:
+            return structured_rows
+        raise IntakeError(
+            "CSV header mismatch. Need exactly: " + ", ".join(REQUIRED_FIELDS)
+        )
 
     rows = parse_structured_blocks(body)
     if not rows:

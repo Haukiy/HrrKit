@@ -120,3 +120,46 @@ Row1,Source,s,kW,car,file.csv
 
     block = issue_intake.find_csv_block(body)
     assert "Row1,Source" in block
+
+
+def test_structured_blocks_survive_data_only_csv_block(tmp_path, monkeypatch):
+    downloads = []
+
+    def fake_download(url: str, dest: Path, token: str) -> bool:
+        downloads.append(url)
+        dest.write_text("t,q\n0,0\n")
+        return True
+
+    monkeypatch.setattr(issue_intake, "download_with_auth", fake_download)
+
+    body = """ID: 1
+Scource in IDEEE: 10.1016/j.firesaf.2025.104558
+Topic: car
+Time Unit: min
+Energy Unit: kW
+Attachment filename: CAR_2010_Test03.csv
+
+the style of the csv is:
+```
+0.0,250.7757913249963
+0.0,365.196814169018
+```
+
+[CAR_2010_Test03.csv](https://example.com/files/CAR_2010_Test03.csv)
+"""
+
+    database = tmp_path / "database.csv"
+    raw_dir = tmp_path / "raw"
+
+    added, updated = issue_intake.ingest_issue(
+        body,
+        issue_number="88",
+        run_id="123",
+        token="",
+        database_path=database,
+        raw_dir=raw_dir,
+    )
+
+    assert added == 1
+    assert updated == 0
+    assert downloads == ["https://example.com/files/CAR_2010_Test03.csv"]
