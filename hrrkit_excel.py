@@ -459,7 +459,8 @@ def read_database(csv_path: Path) -> pd.DataFrame:
 def _collect_pending_rows(db_df: pd.DataFrame) -> List[Tuple[int, pd.Series]]:
     pending_rows: List[Tuple[int, pd.Series]] = []
     for idx, row in db_df.iterrows():
-        processed_at_val = str(row.get("ProcessedAt", "")).strip()
+        processed_at = row.get("ProcessedAt", "")
+        processed_at_val = "" if pd.isna(processed_at) else str(processed_at).strip()
         if processed_at_val and processed_at_val.lower() not in ("nan", "none"):
             print(f"[row {idx}] Skipping already processed row (ProcessedAt={processed_at_val}).")
             continue
