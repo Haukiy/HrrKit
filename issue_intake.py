@@ -252,6 +252,10 @@ def extract_inline_files(body: str) -> Dict[str, str]:
                 filename = marker.group(1).strip()
                 content = "\n".join(rest) + ("\n" if rest else "")
         if filename:
+            first_content_line = next((line.strip() for line in content.splitlines() if line.strip()), "").lower()
+            normalized_header = _normalize_csv_header(first_content_line)
+            if _is_intake_header(normalized_header):
+                continue
             files[pathlib.Path(filename).name] = content
     return files
 
