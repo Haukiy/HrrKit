@@ -110,3 +110,13 @@ time,hrr
     with database.open() as handle:
         rows = list(csv.DictReader(handle))
     assert rows[0]["ID"] == "1"
+
+
+def test_find_csv_block_allows_metadata_block_with_filename_info():
+    body = """```csv filename=intake.csv
+ID,Scource in IDEEE,Time Unit,Energy Unit,Topic,Filename
+Row1,Source,s,kW,car,file.csv
+```"""
+
+    block = issue_intake.find_csv_block(body)
+    assert "Row1,Source" in block

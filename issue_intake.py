@@ -45,6 +45,18 @@ def _normalize_csv_header(value: str) -> str:
     return re.sub(r"\s*,\s*", ",", (value or "").strip().lower())
 
 
+def _is_intake_header(line: str) -> bool:
+    columns = [part.strip().lower() for part in line.split(",") if part.strip()]
+    required = {
+        "id",
+        "scource in ideee",
+        "time unit",
+        "energy unit",
+        "topic",
+    }
+    return required.issubset(set(columns))
+
+
 def find_csv_block(text: str) -> str:
     """Return the first CSV-looking fenced block found in the text."""
 
@@ -54,22 +66,28 @@ def find_csv_block(text: str) -> str:
         block = (match.group(2) or "").strip()
         if not block:
             continue
-        if "filename=" in info_string:
-            continue
+
+        first_line = block.splitlines()[0].strip().lower()
+
         has_csv_language = False
-        for token in re.split(r"\s+", info_string):
+        for token in re.split(r"[\s,]+", info_string):
             if token in ("csv", "text/csv"):
                 has_csv_language = True
                 break
-        if info_string and not has_csv_language:
+
+        if "filename=" in info_string and not _is_intake_header(first_line):
+            # Inline file blocks often use "filename="; skip those unless the
+            # content clearly matches the intake metadata header.
             continue
-        first_line = block.splitlines()[0].strip().lower()
+
+        if info_string and not has_csv_language and not _is_intake_header(first_line):
+            continue
         if not has_csv_language and "," not in first_line:
             # Without an explicit csv info string we only consider blocks that
             # look like comma-separated data. This skips the instructional code
             # block found in the intake issue template.
             continue
-        if re.match(r"^(?:#\s*)?file\s*:", first_line):
+        if re.match(r"^(?:#\s*)?file\s*:", first_line) and not _is_intake_header(first_line):
             continue
         return block
 
