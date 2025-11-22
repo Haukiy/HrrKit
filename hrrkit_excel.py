@@ -27,7 +27,7 @@ Outputs per topic:
 Aggregation plot:
   - Input curves in light grey (low opacity)
   - Overlays: mean, max, QXX
-  - A one-column, N-rows, borderless “Sources (IDEEE)” table directly under the plot, same width.
+  - A one-column, N-rows, borderless “Scources” table directly under the plot, same width.
 
 Run:
   python hrrkit_excel.py
@@ -44,6 +44,7 @@ import json
 import os
 import re
 import shutil
+import unicodedata
 import textwrap
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -943,8 +944,17 @@ def _compute_sources_table_height(n_rows: int, font_size: int = 8) -> float:
     return min(0.48, base + per_row * n_rows)
 
 
+def _clean_source_entry(src: str) -> str:
+    """Normalize and simplify a source string for rendering in the table."""
+    normalized = unicodedata.normalize("NFKC", str(src or "")).strip()
+    normalized = re.sub(r"^\s*\[[^\]]+\]\s*", "", normalized)  # drop leading [ID]
+    normalized = "".join(ch if ch.isprintable() else " " for ch in normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
 def _add_sources_table_below(fig, ax, sources: List[str], table_height: float, font_size: int = 8,
-                             header: str = "Sources (IDEEE)") -> None:
+                             header: str = "Scources") -> None:
     """
     One-column, N-rows, borderless table directly UNDER the plot.
     - Header sits a bit lower.
@@ -955,7 +965,7 @@ def _add_sources_table_below(fig, ax, sources: List[str], table_height: float, f
     cleaned: List[str] = []
     seen_loc: Set[str] = set()
     for s in sources:
-        s = str(s).strip()
+        s = _clean_source_entry(s)
         if s and s not in seen_loc:
             cleaned.append(s)
             seen_loc.add(s)
@@ -978,7 +988,7 @@ def _add_sources_table_below(fig, ax, sources: List[str], table_height: float, f
     table_ax.axis("off")
 
     # Header a bit lower; left aligned at x=0 so rows start parallel to 'S'
-    table_ax.text(0.0, 0.90, header, ha="left", va="top",
+    table_ax.text(0.02, 0.90, header, ha="left", va="top",
                   fontsize=10, fontweight="bold", transform=table_ax.transAxes)
 
     # Borderless table occupying full width under the header
@@ -992,6 +1002,9 @@ def _add_sources_table_below(fig, ax, sources: List[str], table_height: float, f
         colWidths=[1.0],
     )
 
+    tbl.auto_set_font_size(False)
+    row_height = 0.86 / max(1, len(cell_text))
+
     # Remove borders/padding so text aligns flush with header start
     for cell in tbl.get_celld().values():
         cell.set_edgecolor((0, 0, 0, 0))
@@ -1002,6 +1015,7 @@ def _add_sources_table_below(fig, ax, sources: List[str], table_height: float, f
         except Exception:
             pass
         cell.set_text_props(fontsize=font_size, ha="left", va="top")
+        cell.set_height(row_height)
 
 
 def aggregate_topic(base_dir: Path, topic: str, quantile_q: float = AGG_QUANTILE) -> None:
@@ -1120,8 +1134,17 @@ def aggregate_topic(base_dir: Path, topic: str, quantile_q: float = AGG_QUANTILE
     fig.subplots_adjust(bottom=0.08 + table_h)
 
     # Plot inputs in light grey + overlays
+    first_input = True
     for t_arr, v_arr in zip(grids_list, values_list):
-        ax.plot(t_arr, v_arr, color="0.7", linewidth=0.8, alpha=0.2)
+        ax.plot(
+            t_arr,
+            v_arr,
+            color="0.5",
+            linewidth=1.0,
+            alpha=0.35,
+            label="Data" if first_input else None,
+        )
+        first_input = False
     ax.plot(grid_kept, mean_curve, label="Mean", linewidth=2.0)
     ax.plot(grid_kept, max_curve,  label="Max",  linewidth=1.8, linestyle="--")
     ax.plot(grid_kept, quant_curve, label=f"Q{int(quantile_q*100)}", linewidth=1.8, linestyle=":")
